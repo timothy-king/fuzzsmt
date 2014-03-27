@@ -28,21 +28,21 @@ public enum SMTNodeKind {
   NOT("not", 1), 
   AND("and", 2),
   OR("or", 2),
-  IMPLIES("implies", 2),
+  IMPLIES("=>", 2),
   XOR("xor", 2),
-  IFF("iff", 2),
-  IF_THEN_ELSE("if_then_else", 3), // if-then-else on boolean operands 
+  IFF("=", 2),
+  IF_THEN_ELSE("ite", 3), // if-then-else on boolean operands 
   /* bit-vector operators: */
   /* unary operators */
   BVNOT("bvnot", 1),
   BVNEG("bvneg", 1),
   /* unary operators with index */
-  EXTRACT("extract", 1),
-  REPEAT("repeat", 1),
-  ZERO_EXTEND("zero_extend", 1),
-  SIGN_EXTEND("sign_extend", 1),
-  ROTATE_LEFT("rotate_left", 1),
-  ROTATE_RIGHT("rotate_right", 1),
+  EXTRACT("(_ extract", 1),
+  REPEAT("(_ repeat", 1),
+  ZERO_EXTEND("(_ zero_extend", 1),
+  SIGN_EXTEND("(_ sign_extend", 1),
+  ROTATE_LEFT("(_ rotate_left", 1),
+  ROTATE_RIGHT("(_ rotate_right", 1),
   /* commutative binary operators */
   BVAND("bvand", 2),
   BVNAND("bvnand", 2),

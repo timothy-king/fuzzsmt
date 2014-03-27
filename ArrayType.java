@@ -24,7 +24,7 @@ public class ArrayType extends SMTType {
   public ArrayType () {}
 
   public String toString() {
-    return "Array";
+    return "(Array Index Element)";
   }
 
 }

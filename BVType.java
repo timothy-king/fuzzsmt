@@ -27,7 +27,7 @@ public class BVType extends SMTType
   public BVType (int width){
     assert (width > 0);
     this.width = width;
-    this.name = "BitVec["+ width + "]";
+    this.name = "(_ BitVec "+ width + ")";
   }
 
   public String toString (){

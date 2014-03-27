@@ -24,7 +24,7 @@ public class Array1Type extends ArrayType {
   public Array1Type () {}
 
   public String toString() {
-    return "Array1";
+    return "(Array Int Real)";
   }
 
 }

@@ -144,11 +144,11 @@ public class FuzzSMT {
     } else if (n1bw < n2bw){
       ext = n2bw - n1bw;
       if (r.nextBoolean())
-        builder.append ("(zero_extend[");
+        builder.append ("((_ zero_extend ");
       else
-        builder.append ("(sign_extend[");
+        builder.append ("((_ sign_extend ");
       builder.append (ext);
-      builder.append ("] ");
+      builder.append (") ");
       builder.append (n1.getName());
       builder.append (") ");
       builder.append (n2.getName());
@@ -158,11 +158,11 @@ public class FuzzSMT {
       builder.append (n1.getName());
       builder.append (" ");
       if (r.nextBoolean())
-        builder.append ("(zero_extend[");
+        builder.append ("((_ zero_extend ");
       else
-        builder.append ("(sign_extend[");
+        builder.append ("((_ sign_extend ");
       builder.append (ext);
-      builder.append ("] ");
+      builder.append (") ");
       builder.append (n2.getName());
       builder.append (")"); 
     }
@@ -186,11 +186,11 @@ public class FuzzSMT {
     } else if (type.width < bw) {
       diff = bw - type.width;
       if (r.nextBoolean())
-        builder.append ("(zero_extend[");
+        builder.append ("((_ zero_extend ");
       else
-        builder.append ("(sign_extend[");
+        builder.append ("((_ sign_extend ");
       builder.append (diff);
-      builder.append ("] ");
+      builder.append (") ");
       builder.append (n.getName());
       builder.append (")");
     } else {
@@ -202,11 +202,11 @@ public class FuzzSMT {
       assert (upper >= 0);
       assert (upper >= lower);
       assert (upper < type.width);
-      builder.append ("(extract[");
+      builder.append ("((_ extract ");
       builder.append (upper);
-      builder.append (":");
+      builder.append (" ");
       builder.append (lower);
-      builder.append ("] ");
+      builder.append (") ");
       builder.append (n.getName());
       builder.append (")");
     }
@@ -229,11 +229,11 @@ public class FuzzSMT {
     builder = new StringBuilder();
     for (int i = 0; i < numVars; i++) {
       name = "v" + SMTNode.getNodeCtr();
-      builder.append (":extrafuns ((");
+      builder.append ("(declare-fun ");
       builder.append (name);
-      builder.append (" ");
+      builder.append (" () ");
       builder.append (type.toString());
-      builder.append ("))\n");
+      builder.append (")\n");
       nodes.add (new SMTNode (type, name));
     }
     System.out.print (builder.toString());
@@ -260,11 +260,11 @@ public class FuzzSMT {
       bw = selectRandValRange (r, minBW, maxBW);
       assert (bw >= minBW && bw <= maxBW);
       name = "v" + SMTNode.getNodeCtr();
-      builder.append (":extrafuns ((");
+      builder.append ("(declare-fun ");
       builder.append (name);
-      builder.append (" BitVec[");
+      builder.append (" () (_ BitVec ");
       builder.append (bw);
-      builder.append ("]))\n");
+      builder.append ("))\n");
       node = new SMTNode (new BVType (bw), name);
       nodes.add (node);
     }
@@ -294,15 +294,15 @@ public class FuzzSMT {
     for (int i = 0; i < numConsts; i++) {
       bw = selectRandValRange (r, minBW, maxBW);
       assert (bw >= minBW && bw <= maxBW);
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       bi = new BigInteger(bw, r);
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
-      builder.append (" bv");
+      builder.append ("(_ bv");
       builder.append (bi.toString());
-      builder.append ("[");
+      builder.append (" ");
       builder.append (bw);
-      builder.append ("])\n");
+      builder.append (")))\n");
       node = new SMTNode (new BVType (bw), name);
       nodes.add (node);
     }
@@ -332,13 +332,12 @@ public class FuzzSMT {
       valWidth = selectRandValRange (r, minBW, maxBW); 
       assert (valWidth >= minBW && valWidth <= maxBW);
       name = "a" + SMTNode.getNodeCtr();
-      builder.append (":extrafuns ((");
+      builder.append ("(declare-fun ");
       builder.append (name);
-      builder.append (" Array[");
-      builder.append (indexWidth);
-      builder.append (":");
-      builder.append (valWidth);
-      builder.append ("]))\n");
+      builder.append (" () (Array ");
+      builder.append (" (_ BitVec " + indexWidth + ") ");
+      builder.append (" (_ BitVec " + valWidth + ")");
+      builder.append ("))\n");
       node = new SMTNode (new BVArrayType (indexWidth, valWidth), name);
       nodes.add (node);
     }
@@ -368,14 +367,14 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     for (int i = 0; i < numConsts; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       bw = r.nextInt (maxBW) + 1;
       bi = new BigInteger(bw, r);
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" ");
       builder.append (bi.toString());
-      builder.append (")\n");
+      builder.append ("))\n");
       nodes.add (new SMTNode (IntType.intType, name));
     }
     System.out.print (builder.toString());
@@ -414,12 +413,12 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     for (int i = 0; i < numConsts; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
-      builder.append ("(let (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" ");
       builder.append (bi.toString());
-      builder.append (")\n");
+      builder.append ("))\n");
       node = new SMTNode (IntType.intType, name);
       nodes.add (node);
       if (bi.equals(BigInteger.ZERO))
@@ -458,14 +457,14 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     for (int i = 0; i < numConsts; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
-      builder.append ("(let (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" ");
       builder.append (bi.toString());
       if (printAsReal)
         builder.append (".0");
-      builder.append (")\n");
+      builder.append ("))\n");
       node = new SMTNode (RealType.realType, name);
       nodes.add (node);
       if (bi.equals(BigInteger.ZERO))
@@ -489,7 +488,7 @@ public class FuzzSMT {
     for (int i = 0; i < numUTypes; i++) {
       name = "S" + i;
       types.add (new UType (name));
-      builder.append (":extrasorts (");
+      builder.append ("(declare-sort ");
       builder.append (name);
       builder.append (")\n");
     }
@@ -564,15 +563,15 @@ public class FuzzSMT {
         todoResult.remove (resultType);
       sig = new Signature (operandTypes, resultType);
       funcs.add (new UFunc (name, sig));
-      builder.append (":extrafuns ((");
-      builder.append (name);
+      builder.append ("(declare-fun ");
+      builder.append (name + " (");
       for (int i = 0; i < numArgs; i++) {
         builder.append (" ");
         builder.append (operandTypes.get(i).toString());
       }
-      builder.append (" ");
+      builder.append (") ");
       builder.append (resultType.toString());
-      builder.append ("))\n");
+      builder.append (")\n");
       generated++;
     }
     System.out.print (builder.toString());
@@ -621,13 +620,14 @@ public class FuzzSMT {
       }
       sig = new Signature (operandTypes, BoolType.boolType);
       preds.add (new UPred (name, sig));
-      builder.append (":extrapreds ((");
+      builder.append ("(declare-fun ");
       builder.append (name);
+      builder.append (" (");
       for (int i = 0; i < numArgs; i++) {
         builder.append (" ");
         builder.append (operandTypes.get(i).toString());
       }
-      builder.append ("))\n");
+      builder.append (") Bool)\n");
       generated++;
     }
     System.out.print (builder.toString());
@@ -672,15 +672,15 @@ public class FuzzSMT {
       resultType = new BVType (bw);
       sig = new Signature (operandTypes, resultType);
       funcs.add (new UFunc (name, sig));
-      builder.append (":extrafuns ((");
-      builder.append (name);
+      builder.append ("(declare-fun ");
+      builder.append (name + " (");
       for (int j = 0; j < numArgs; j++) {
         builder.append (" ");
         builder.append (operandTypes.get(j).toString());
       }
-      builder.append (" ");
+      builder.append (") ");
       builder.append (resultType.toString());
-      builder.append ("))\n");
+      builder.append (")\n");
     }
     System.out.print (builder.toString());
     return numFuncs;
@@ -719,13 +719,14 @@ public class FuzzSMT {
       }
       sig = new Signature (operandTypes, BoolType.boolType);
       preds.add (new UPred (name, sig));
-      builder.append (":extrapreds ((");
+      builder.append ("(declare-fun ");
       builder.append (name);
+      builder.append (" (");
       for (int j = 0; j < numArgs; j++) {
         builder.append (" ");
         builder.append (operandTypes.get(j).toString());
       }
-      builder.append ("))\n");
+      builder.append (") Bool)\n");
     }
     System.out.print (builder.toString());
     return numPreds;
@@ -785,6 +786,7 @@ public class FuzzSMT {
       kindSet.remove (SMTNodeKind.BVSREM);
       kindSet.remove (SMTNodeKind.BVSMOD);
     }
+    kindSet.remove (SMTNodeKind.BVSMOD); /* Semantics changed; SMOD disabled for now */
     if (!uFuncs.isEmpty())
       kindSet.add (SMTNodeKind.UFUNC);
     if (!uPreds.isEmpty())
@@ -809,8 +811,8 @@ public class FuzzSMT {
     builder = new StringBuilder();
     while (!todoNodes.isEmpty() || !todoUFuncs.isEmpty() ||
            !todoUPreds.isEmpty()){
-      name = "?e" + SMTNode.getNodeCtr();
-      builder.append ("(let (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
 
@@ -843,36 +845,36 @@ public class FuzzSMT {
             case EXTRACT:
               upper = r.nextInt(n1BW);
               lower = r.nextInt (upper + 1);
-              builder.append ("[");
+              builder.append (" ");
               builder.append (upper);
-              builder.append (":");
+              builder.append (" ");
               builder.append (lower);
-              builder.append ("] ");
+              builder.append (") ");
               resBW = upper - lower + 1;
               break;
             case ROTATE_LEFT:
             case ROTATE_RIGHT:
               rotate = r.nextInt(n1BW);
-              builder.append ("[");
+              builder.append (" ");
               builder.append (rotate);
-              builder.append ("] ");
+              builder.append (") ");
               resBW = n1BW;
               break;
             case ZERO_EXTEND:
             case SIGN_EXTEND:
               ext = r.nextInt(maxBW - n1BW + 1);
-              builder.append ("[");
+              builder.append (" ");
               builder.append (ext);
-              builder.append ("] ");
+              builder.append (") ");
               resBW = n1BW + ext;
               break;
             default:
               assert (kind == SMTNodeKind.REPEAT);
               maxRep = maxBW / n1BW;
               rep = r.nextInt(maxRep) + 1;
-              builder.append ("[");
+              builder.append (" ");
               builder.append (rep);
-              builder.append ("] ");
+              builder.append (") ");
               resBW = n1BW * rep;
               break;
           }
@@ -907,7 +909,7 @@ public class FuzzSMT {
               builder.append (kind.getString());
               builder.append (" ");
               builder.append (wrapEqualBW (r, n1, n2));
-              builder.append (") bv1[1] bv0[1]");
+              builder.append (") (_ bv1 1) (_ bv0 1)");
               resBW = 1;
               break;
             case CONCAT:
@@ -973,11 +975,11 @@ public class FuzzSMT {
           pos = r.nextInt(n1BW);
           builder.append (kind.getString());
           /* ite condition: is bit at random bit position set to 1? */
-          builder.append (" (= bv1[1] (extract[");
+          builder.append (" (= (_ bv1 1) ((_ extract ");
           builder.append (pos);
-          builder.append (":");
+          builder.append (" ");
           builder.append (pos);
-          builder.append ("] ");
+          builder.append (") ");
           builder.append (n1.getName());
           builder.append (")) ");
           builder.append (wrapEqualBW(r, n2, n3));
@@ -1049,7 +1051,7 @@ public class FuzzSMT {
                 builder.append (adaptBW (r, n2, curType.getWidth()));
                 updateNodeRefs (todoNodes, n2, minRefs);
               }
-              builder.append (") bv1[1] bv0[1]");
+              builder.append (") (_ bv1 1) (_ bv0 1)");
               assert (sig.getResultType() == BoolType.boolType);
               resBW = 1;
               break;
@@ -1062,7 +1064,7 @@ public class FuzzSMT {
               builder.append (kind.getString());
               builder.append (" ");
               builder.append (wrapEqualBW (r, n1, n2));
-              builder.append (") bv1[1] bv0[1]");
+              builder.append (") (_ bv1 1) (_ bv0 1)");
               resBW = 1;
               updateNodeRefs (todoNodes, n1, minRefs);
               updateNodeRefs (todoNodes, n2, minRefs);
@@ -1071,7 +1073,7 @@ public class FuzzSMT {
           break;
       }
 
-      builder.append ("))\n");
+      builder.append (")))\n");
       assert (resBW <= maxBW);
       nodes.add (new SMTNode (new BVType (resBW), name));
 
@@ -1098,12 +1100,12 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     for (int i = 0; i < numWrites; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       array = arrays.get(r.nextInt(arrays.size()));
       assert (array.getType() instanceof BVArrayType);
       aIndexWidth = ((BVArrayType) array.getType()).indexWidth;
       aValWidth = ((BVArrayType) array.getType()).valWidth;
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (store ");
       builder.append (array.getName());
@@ -1119,7 +1121,7 @@ public class FuzzSMT {
       builder.append (adaptBW (r, index, aIndexWidth));
       builder.append (" ");
       builder.append (adaptBW (r, val, aValWidth));
-      builder.append ("))\n");
+      builder.append (")))\n");
       arrays.add (new SMTNode (new BVArrayType (aIndexWidth, aValWidth), name));
     }
     System.out.print (builder.toString());
@@ -1144,12 +1146,12 @@ public class FuzzSMT {
     builder = new StringBuilder();
     sizeArrays = arrays.size();
     for (int i = 0; i < numReads; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       array = arrays.get(r.nextInt(sizeArrays));
       assert (array.getType() instanceof BVArrayType);
       aIndexWidth = ((BVArrayType) array.getType()).indexWidth;
       aValWidth = ((BVArrayType) array.getType()).valWidth;
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (select ");
       builder.append (array.getName());
@@ -1160,7 +1162,7 @@ public class FuzzSMT {
       indexWidth = ((BVType) index.getType()).width;
 
       builder.append (adaptBW (r, index, aIndexWidth));
-      builder.append ("))\n");
+      builder.append (")))\n");
       bvs.add (new SMTNode (new BVType (aValWidth), name));
     }
     System.out.print (builder.toString());
@@ -1185,20 +1187,20 @@ public class FuzzSMT {
     oldSize = bvs.size();
     sizeArrays = arrays.size();
     for (int i = 0; i < numExt; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       do {
         a1 = arrays.get(r.nextInt(sizeArrays));
         a2 = arrays.get(r.nextInt(sizeArrays));
         assert (a1.getType() instanceof BVArrayType);
         assert (a2.getType() instanceof BVArrayType);
       } while (!a1.getType().equals(a2.getType()));
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (ite (= ");
       builder.append (a1.getName());
       builder.append (" ");
       builder.append (a2.getName());
-      builder.append (") bv1[1] bv0[1]))\n");
+      builder.append (") (_ bv1 1) (_ bv0 1))))\n");
       bvs.add (new SMTNode (new BVType (1), name));
     }
     System.out.print (builder.toString());
@@ -1231,10 +1233,10 @@ public class FuzzSMT {
     sizeIndices = indices.size();
     sizeElements = elements.size();
     for (int i = 0; i < numWrites; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       array = arrays.get(r.nextInt(arrays.size()));
       assert (array.getType() instanceof ArrayType);
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (store ");
       builder.append (array.getName());
@@ -1244,7 +1246,7 @@ public class FuzzSMT {
       builder.append (index.getName());
       builder.append (" ");
       builder.append (element.getName());
-      builder.append ("))\n");
+      builder.append (")))\n");
       arrays.add (new SMTNode (resultType, name));
     }
     System.out.print (builder.toString());
@@ -1275,17 +1277,17 @@ public class FuzzSMT {
     sizeArrays = arrays.size();
     sizeIndices = indices.size();
     for (int i = 0; i < numReads; i++) {
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       array = arrays.get(r.nextInt(sizeArrays));
       assert (array.getType() instanceof ArrayType);
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (select ");
       builder.append (array.getName());
       builder.append (" ");
       index = indices.get(r.nextInt(sizeIndices));
       builder.append (index.getName());
-      builder.append ("))\n");
+      builder.append (")))\n");
       elements.add (new SMTNode (resultType, name));
     }
     System.out.print (builder.toString());
@@ -1355,9 +1357,9 @@ public class FuzzSMT {
     oldSize = intNodes.size();
     while (!todoIntNodes.isEmpty() || !todoIntConsts.isEmpty() ||
            !todoUFuncs.isEmpty() || !todoUPreds.isEmpty()) {
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       kind = kinds[r.nextInt(kinds.length)];
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       if (noBlowup && r.nextBoolean() && !todoIntNodes.isEmpty()) {
@@ -1484,7 +1486,7 @@ public class FuzzSMT {
           assert (sig.getResultType() == BoolType.boolType);
           break;
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
         
       intNodes.add (new SMTNode (IntType.intType, name));
     }
@@ -1560,9 +1562,9 @@ public class FuzzSMT {
     sizeIntConsts = intConstsAsReal.size();
     while (!todoRealNodes.isEmpty() || !todoIntConsts.isEmpty() ||
            !todoUFuncs.isEmpty() || !todoUPreds.isEmpty()){
-      name = "?e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       kind = kinds[r.nextInt(kinds.length)];
-      builder.append ("(let (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       if (kind != SMTNodeKind.DIV) {
@@ -1718,7 +1720,7 @@ public class FuzzSMT {
           assert (sig.getResultType() == BoolType.boolType);
           break;
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
         
       realNodes.add (new SMTNode (RealType.realType, name));
     }
@@ -1789,8 +1791,8 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     while (!todoNodes.isEmpty() || !todoFuncs.isEmpty()){
-      name = "?e" + SMTNode.getNodeCtr();
-      builder.append ("(let (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       /* either select function or at least one 
@@ -1844,7 +1846,7 @@ public class FuzzSMT {
           builder.append (node.getName());
         }
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
       nodes.add (new SMTNode (resultType, name));
     }
     System.out.print (builder.toString());
@@ -1882,8 +1884,8 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     while (!todoNodes.isEmpty() || !todoBoolNodes.isEmpty()){
-      name = "?e" + SMTNode.getNodeCtr();
-      builder.append ("(let (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (ite ");
       /* either choose a random formula or one of the todo list 
@@ -1913,7 +1915,7 @@ public class FuzzSMT {
       builder.append (n1.getName());
       builder.append (" ");
       builder.append (n2.getName());
-      builder.append ("))\n");
+      builder.append (")))\n");
       updateNodeRefs (todoBoolNodes, f, minRefs);
       updateNodeRefs (todoNodes, n1, minRefs);
       updateNodeRefs (todoNodes, n2, minRefs);
@@ -1975,8 +1977,8 @@ public class FuzzSMT {
     oldSize = boolNodes.size();
     sizeBVNodes = bvNodes.size();
     while (!todoNodes.isEmpty() || !todoUPreds.isEmpty()){
-         name = "$e" + SMTNode.getNodeCtr();
-      builder.append ("(flet (");
+         name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       /* increase probability to select upred
@@ -2020,7 +2022,7 @@ public class FuzzSMT {
         updateNodeRefs (todoNodes, n1, minRefs);
         updateNodeRefs (todoNodes, n2, minRefs);
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
       boolNodes.add (new SMTNode (BoolType.boolType, name));
     }
     System.out.print (builder.toString());
@@ -2063,9 +2065,9 @@ public class FuzzSMT {
     builder = new StringBuilder();
     oldSize = boolNodes.size();
     while (!todo.isEmpty()){
-      name = "$e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       kind = kinds[r.nextInt (kinds.length)];
-      builder.append ("(flet (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       builder.append (kind.getString());
@@ -2094,7 +2096,7 @@ public class FuzzSMT {
         builder.append (" ");
         builder.append (v2.getName());
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
       boolNodes.add (new SMTNode (BoolType.boolType, name));
       updateNodeRefs (todo, v1, minRefs);
       updateNodeRefs (todo, v2, minRefs);
@@ -2146,9 +2148,9 @@ public class FuzzSMT {
     builder = new StringBuilder();
     oldSize = boolNodes.size();
     while (!todo.isEmpty()){
-      name = "$e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       kind = kinds[r.nextInt (kinds.length)];
-      builder.append ("(flet (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       builder.append (kind.getString());
@@ -2223,7 +2225,7 @@ public class FuzzSMT {
           builder.append (c1.getName());
         }
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
       boolNodes.add (new SMTNode (BoolType.boolType, name));
       updateNodeRefs (todo, v1, minRefs);
       updateNodeRefs (todo, v2, minRefs);
@@ -2294,8 +2296,8 @@ public class FuzzSMT {
     sizeNodes = nodes.size();
     oldSize = boolNodes.size();
     while (!todoNodes.isEmpty() || !todoUPreds.isEmpty()){
-      name = "$e" + SMTNode.getNodeCtr();
-      builder.append ("(flet (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       if (noBlowup && r.nextBoolean() && !todoNodes.isEmpty()) {
@@ -2338,7 +2340,7 @@ public class FuzzSMT {
         updateNodeRefs (todoNodes, n1, minRefs);
         updateNodeRefs (todoNodes, n2, minRefs);
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
       boolNodes.add (new SMTNode (BoolType.boolType, name));
     }
     System.out.print (builder.toString());
@@ -2383,8 +2385,8 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     while (!todoNodes.isEmpty() || !todoPreds.isEmpty()){
-      name = "$e" + SMTNode.getNodeCtr();
-      builder.append ("(flet (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       if (r.nextBoolean() || todoNodes.isEmpty()) {
@@ -2425,7 +2427,7 @@ public class FuzzSMT {
         updateNodeRefs (todoNodes, n1, minRefs);
         updateNodeRefs (todoNodes, n2, minRefs);
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
       boolNodes.add (new SMTNode (BoolType.boolType, name));
     }
     System.out.print (builder.toString());
@@ -2459,8 +2461,8 @@ public class FuzzSMT {
 
     builder = new StringBuilder();
     while (nodes.size() > 1){
-      name = "$e" + SMTNode.getNodeCtr();
-      builder.append ("(flet (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
       n1 = nodes.get(r.nextInt(nodes.size()));
@@ -2502,7 +2504,7 @@ public class FuzzSMT {
         builder.append (n2.getName());
         break;
       }
-      builder.append ("))\n");
+      builder.append (")))\n");
       generated++;
       nodes.add (new SMTNode (BoolType.boolType, name));
       nodes.remove (n1);
@@ -2529,9 +2531,9 @@ public class FuzzSMT {
     if (nodes.size() == 1)
       return 0;
 
-    name = "$e" + SMTNode.getNodeCtr();
+    name = "e" + SMTNode.getNodeCtr();
     builder = new StringBuilder(); 
-    builder.append ("(flet (");
+    builder.append ("(let (");
     builder.append (name);
     builder.append (" \n");
     builder.append ("(");
@@ -2546,7 +2548,7 @@ public class FuzzSMT {
     }
     nodes.clear();
     nodes.add (new SMTNode (BoolType.boolType, name));
-    builder.append ("))\n");
+    builder.append (")))\n");
     System.out.print (builder.toString());
     return 1;
   }
@@ -2585,9 +2587,9 @@ public class FuzzSMT {
     if (numClauses <= 1)
       numClauses = 2;
 
-    name = "$e" + SMTNode.getNodeCtr();
+    name = "e" + SMTNode.getNodeCtr();
     builder = new StringBuilder();
-    builder.append ("(flet (");
+    builder.append ("(let ((");
     builder.append (name);
     builder.append (" \n(and\n");
     for (int i = 0; i < numClauses; i++){
@@ -2606,7 +2608,7 @@ public class FuzzSMT {
       }
       builder.append (")\n");
     }
-    builder.append ("))\n");
+    builder.append (")))\n");
     nodes.clear();
     nodes.add (new SMTNode (BoolType.boolType, name));
     System.out.print (builder.toString());
@@ -2635,16 +2637,16 @@ public class FuzzSMT {
       guard = guards[i];
       assert (guard.getType() instanceof BVType);
       bw = ((BVType) guard.getType()).width;
-      name = "$e" + SMTNode.getNodeCtr();
-      builder.append ("(flet (");
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (and ");
       builder.append (cur.getName());
       builder.append (" (not (= ");
       builder.append (guard.getName());
-      builder.append (" bv0[");
+      builder.append (" (_ bv0 ");
       builder.append (bw);
-      builder.append ("]))))\n");
+      builder.append ("))))))\n");
       cur = new SMTNode (BoolType.boolType, name);
       generated++;
       kind = guardsMap.get(guard);
@@ -2652,16 +2654,16 @@ public class FuzzSMT {
       /* also rule out division by -1 */
       if (kind == SMTNodeKind.BVSDIV || kind == SMTNodeKind.BVSREM ||
           kind == SMTNodeKind.BVSMOD) {
-        name = "$e" + SMTNode.getNodeCtr();
-        builder.append ("(flet (");
+        name = "e" + SMTNode.getNodeCtr();
+        builder.append ("(let ((");
         builder.append (name);
         builder.append (" (and ");
         builder.append (cur.getName());
         builder.append (" (not (= ");
         builder.append (guard.getName());
-        builder.append (" (bvnot bv0[");
+        builder.append (" (bvnot (_ bv0 ");
         builder.append (bw);
-        builder.append ("])))))\n");
+        builder.append (")))))))\n");
         cur = new SMTNode (BoolType.boolType, name);
         generated++;
       }
@@ -2691,20 +2693,20 @@ public class FuzzSMT {
     oldSize = boolNodes.size();
     sizeArrays = arrays.size();
     for (int i = 0; i < numExt; i++) {
-      name = "$e" + SMTNode.getNodeCtr();
+      name = "e" + SMTNode.getNodeCtr();
       do {
         a1 = arrays.get(r.nextInt(sizeArrays));
         a2 = arrays.get(r.nextInt(sizeArrays));
         assert (a1.getType() instanceof ArrayType);
         assert (a2.getType() instanceof ArrayType);
       } while (!a1.getType().equals(a2.getType()));
-      builder.append ("(flet (");
+      builder.append ("(let ((");
       builder.append (name);
       builder.append (" (= ");
       builder.append (a1.getName());
       builder.append (" ");
       builder.append (a2.getName());
-      builder.append ("))\n");
+      builder.append (")))\n");
       boolNodes.add (new SMTNode (BoolType.boolType, name));
     }
     System.out.print (builder.toString());
@@ -2713,7 +2715,7 @@ public class FuzzSMT {
     return boolNodes.size() - oldSize;
   }
 
-  private static void generateQFormulasUF (Random r, SMTType type, 
+  private static int generateQFormulasUF (Random r, SMTType type, 
                                            List<UFunc> uFuncs, 
                                            List<UPred> uPreds, 
                                            int numQFormulas, int minQVars, 
@@ -2776,22 +2778,25 @@ public class FuzzSMT {
     if (!uPreds.isEmpty())
       uPredsArray = uPreds.toArray (new UPred[0]);
 
+    int and_pars = 0;
+
     builder = new StringBuilder();
     for (int i = 0; i < numQFormulas; i++) {
       assert (todoQVarNames.isEmpty());
       assert (boolNames.isEmpty());
       numQNestings = selectRandValRange (r, minQNestings, maxQNestings); 
-      builder.append (":assumption\n");
+      builder.append ("(and \n");
+      and_pars++;
       pars = 0;
       for (int j = 0; j <= numQNestings; j++) {
         pars++;
         numQVars = selectRandValRange (r, minQVars, maxQVars); 
         if (r.nextBoolean())
-          builder.append ("(forall ");
+          builder.append ("(forall (");
         else
-          builder.append ("(exists ");
+          builder.append ("(exists (");
         for (int k = 0; k < numQVars; k++) {
-          name = "?qvar" + qVarCounter++;
+          name = "qvar" + qVarCounter++;
           todoQVarNames.put (name, new Integer (minRefs));
           builder.append ("(");
           builder.append (name);
@@ -2799,12 +2804,12 @@ public class FuzzSMT {
           builder.append (type.toString());
           builder.append ( ") ");
         }
-        builder.append ("\n");
+        builder.append (")\n");
       }
       qVarNamesArray = todoQVarNames.keySet().toArray(new String[0]);
       while (!todoQVarNames.isEmpty()){
-        name = "$qf" + nodeCounter++;
-        builder.append ("(flet (");
+        name = "qf" + nodeCounter++;
+        builder.append ("(let ((");
         builder.append (name);
         builder.append (" (");
         pars++;
@@ -2847,14 +2852,14 @@ public class FuzzSMT {
             updateStringRefs (todoQVarNames, s1, minRefs);
           }
         }
-        builder.append ("))\n");
+        builder.append (")))\n");
         boolNames.add (name);
       }
       assert (boolNames.size() > 0);
       while (boolNames.size() > 1) {
         boolNamesArray = boolNames.toArray(new String[0]);
-        name = "$qf" + nodeCounter++;
-        builder.append ("(flet (");
+        name = "qf" + nodeCounter++;
+        builder.append ("(let ((");
         builder.append (name);
         builder.append (" (");
         s1 = boolNamesArray[r.nextInt(boolNamesArray.length)];
@@ -2891,7 +2896,7 @@ public class FuzzSMT {
           builder.append (s2);
           break;
         }
-        builder.append ("))\n");
+        builder.append (")))\n");
         boolNames.add (name);
         boolNames.remove (s1);
         if (s2 != null)
@@ -2909,6 +2914,7 @@ public class FuzzSMT {
       builder.append ("\n");
     }
     System.out.print (builder.toString());
+    return and_pars;
   }
 
 
@@ -3416,6 +3422,8 @@ public class FuzzSMT {
 
     switch (logic) {
       case QF_A:
+	  System.out.println("QF_A is not an SMT-lib 2.0 category.");
+	  System.exit(0);
       case QF_AX:
         minNumArrays = 1;
         maxNumArrays = 3;
@@ -3579,6 +3587,8 @@ public class FuzzSMT {
         minRefs = 5;
         break;
       case QF_UFNIA:
+	  System.out.println("QF_UFNIA is not an SMT-lib 2.0 category.");
+	  System.exit(0);
       case QF_UFNRA:
       case QF_UFLIA:
       case QF_UFLRA:
@@ -4183,9 +4193,11 @@ public class FuzzSMT {
     boolNodes = new ArrayList<SMTNode>();
     assert (r != null);
     assert (logic != null);
-    System.out.println ("(benchmark fuzzsmt");
-    System.out.println (":logic " + logic.toString());
-    System.out.println (":status unknown");
+    System.out.print ("(set-info :source |fuzzsmt|)\n");
+    System.out.print ("(set-info :smt-lib-version 2.0)\n");
+    System.out.print ("(set-info :category \"random\")\n");
+    System.out.print ("(set-info :status unknown)\n");
+    System.out.print ("(set-logic " + logic.toString() + ")\n");
     switch (logic) {
       case QF_BV:
       case QF_UFBV:{
@@ -4196,7 +4208,7 @@ public class FuzzSMT {
         generateUFuncsBV (r, uFuncs, numUFuncs, minArgs, maxArgs, minBW, maxBW);
         generateUPredsBV (r, uPreds, numUPreds, minArgs, maxArgs, minBW, maxBW);
         generateBVVars (r, bvNodes, numVars, minBW, maxBW);
-        System.out.println (":formula");
+        System.out.print ("(assert ");
         pars += generateBVConsts (r, bvNodes, numConsts, minBW, maxBW); 
         pars += generateBVLayer (r, bvNodes, minRefs, minBW, maxBW, bvDivMode,
                                  BVDivGuards, false, uFuncs, uPreds);
@@ -4216,7 +4228,7 @@ public class FuzzSMT {
         generateUPredsBV (r, uPreds, numUPreds, minArgs, maxArgs, minBW, maxBW);
         generateBVVars (r, bvNodes, numVars, minBW, maxBW);
         generateBVArrayVars (r, arrayNodes, numArrays, minBW, maxBW);
-        System.out.println (":formula");
+        System.out.print ("(assert ");
 
         /* half of extensional array equalities are encoded intot bit-vector, 
          * the other half into the boolean part */
@@ -4266,13 +4278,15 @@ public class FuzzSMT {
         SMTType arrayType = ArrayType.arrayType; 
         SMTType indexType = new UType ("Index");
         SMTType elementType = new UType ("Element");
+	System.out.print("(declare-sort Index 0)\n");
+	System.out.print("(declare-sort Element 0)\n");
         ArrayList<SMTNode> arrays = new ArrayList<SMTNode>();
         ArrayList<SMTNode> indices = new ArrayList<SMTNode>();
         ArrayList<SMTNode> elements = new ArrayList<SMTNode>();
         generateVarsOfOneType (arrays, numArrays, arrayType);
         generateVarsOfOneType (indices, numIndices, indexType);
         generateVarsOfOneType (elements, numElements, elementType);
-        System.out.println (":formula");
+        System.out.print ("(assert ");
         numWritesH = (numWrites >>> 1) + (numWrites & 1);
         numReadsH = (numReads >>> 1) + (numReads & 1);
         numWrites >>>= 1;
@@ -4326,6 +4340,8 @@ public class FuzzSMT {
         ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
         ArrayList<UFunc> uFuncsArray = new ArrayList<UFunc>();
         ArrayList<UPred> uPredsArray = new ArrayList<UPred>();
+	System.out.print("(define-sort Index () Int)\n");
+	System.out.print("(define-sort Element () Int)\n");
 
         sortsInt.add (IntType.intType);
         sortsArray.add (ArrayType.arrayType);
@@ -4346,16 +4362,16 @@ public class FuzzSMT {
 
         generateIntVars (intNodes, numVars);
         generateVarsOfOneType (arrays, numArrays, ArrayType.arrayType);
+        System.out.print ("(assert ");
         if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
-          generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
+	    pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
                                numQFormulasInt, minQVars, maxQVars, 
                                minQNestings, maxQNestings, false, minRefs);
         if (numQFormulasArray > 0 && (numUFuncsArray > 0 || numUPredsArray > 0))
-          generateQFormulasUF (r, ArrayType.arrayType, uFuncsArray, 
+	    pars+=generateQFormulasUF (r, ArrayType.arrayType, uFuncsArray, 
                                uPredsArray, numQFormulasArray, minQVars, 
                                maxQVars, minQNestings, maxQNestings, true, 
                                minRefs);
-        System.out.println (":formula");
 
         pars += generateIntConsts (r, intConsts, numConsts, maxBW);
         numWritesH = (numWrites >>> 1) + (numWrites & 1);
@@ -4432,6 +4448,8 @@ public class FuzzSMT {
         ArrayList<UPred> uPredsArray1 = new ArrayList<UPred>();
         ArrayList<UFunc> uFuncsArray2 = new ArrayList<UFunc>();
         ArrayList<UPred> uPredsArray2 = new ArrayList<UPred>();
+	System.out.print("(declare-sort Index 0)\n");
+	System.out.print("(declare-sort Element 0)\n");
 
         sortsInt.add (IntType.intType);
         sortsReal.add (RealType.realType);
@@ -4469,27 +4487,27 @@ public class FuzzSMT {
         generateVarsOfOneType (arrays1, numArrays1, Array1Type.array1Type);
         generateVarsOfOneType (arrays2, numArrays2, Array2Type.array2Type);
 
+        System.out.print ("(assert ");
         if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
-          generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
+	    pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
                                numQFormulasInt, minQVars, maxQVars, 
                                minQNestings, maxQNestings, false, minRefs);
         if (numQFormulasReal > 0 && (numUFuncsReal > 0 || numUPredsReal > 0))
-          generateQFormulasUF (r, RealType.realType, uFuncsReal, uPredsReal,
+	    pars+=generateQFormulasUF (r, RealType.realType, uFuncsReal, uPredsReal,
                                numQFormulasReal, minQVars, maxQVars, 
                                minQNestings, maxQNestings, false, minRefs);
         if (numQFormulasArray1 > 0 
             && (numUFuncsArray1 > 0 || numUPredsArray1 > 0))
-          generateQFormulasUF (r, Array1Type.array1Type, uFuncsArray1, 
+          pars+=generateQFormulasUF (r, Array1Type.array1Type, uFuncsArray1, 
                                uPredsArray1, numQFormulasArray1, minQVars, 
                                maxQVars, minQNestings, maxQNestings, true, 
                                minRefs);
         if (numQFormulasArray2 > 0 
             && (numUFuncsArray2 > 0 || numUPredsArray2 > 0))
-          generateQFormulasUF (r, Array2Type.array2Type, uFuncsArray2, 
+          pars+=generateQFormulasUF (r, Array2Type.array2Type, uFuncsArray2, 
                                uPredsArray2, numQFormulasArray2, minQVars, 
                                maxQVars, minQNestings, maxQNestings, true, 
                                minRefs);
-        System.out.println (":formula");
 
         pars += generateIntConsts (r, intConsts, numConstsInt, maxBW);
         pars += generateRealConstsNotFilledZero (r, intConstsAsReal, zeroConsts,
@@ -4605,7 +4623,7 @@ public class FuzzSMT {
         ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
         ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
         generateIntVars (intNodes, numVars);
-        System.out.println (":formula");
+	System.out.print ("(assert ");
         pars += generateIntConsts (r, intConsts, numConsts, maxBW);
         pars += generateIDLLayer (r, intNodes, intConsts, boolNodes, minRefs);
       }
@@ -4624,7 +4642,7 @@ public class FuzzSMT {
           generateUFuncs (r, sortsInt, uFuncs, numUFuncs, minArgs, maxArgs);
         if (numUPreds > 0)
           generateUPreds (r, sortsInt, uPreds, numUPreds, minArgs, maxArgs);
-        System.out.println (":formula");
+	System.out.print ("(assert ");
         pars += generateIntConsts (r, intConsts, numConsts, maxBW);
         pars += generateIDLLayer (r, intNodes, intConsts, boolNodes, minRefs);
         if (numUFuncs > 0)
@@ -4640,7 +4658,7 @@ public class FuzzSMT {
         ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
         HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
         generateRealVars (realVars, numVars);
-        System.out.println (":formula");
+	System.out.print ("(assert ");
         pars += generateIntConstsNotFilledZero (r, intConsts, zeroConsts, 
                                                 numConsts, maxBW);
         pars += generateRDLLayer (r, realVars, intConsts, zeroConsts, 
@@ -4662,7 +4680,7 @@ public class FuzzSMT {
           generateUFuncs (r, sortsReal, uFuncs, numUFuncs, minArgs, maxArgs);
         if (numUPreds > 0)
           generateUPreds (r, sortsReal, uPreds, numUPreds, minArgs, maxArgs);
-        System.out.println (":formula");
+	System.out.print ("(assert ");
         pars += generateIntConstsNotFilledZero (r, intConsts, zeroConsts, 
                                                 numConsts, maxBW);
         pars += generateRDLLayer (r, realNodes, intConsts, zeroConsts, 
@@ -4693,7 +4711,7 @@ public class FuzzSMT {
           generateUPreds (r, sorts, uPreds, numUPreds, minArgs, maxArgs);
 
         generateIntVars (intNodes, numVars);
-        System.out.println (":formula");
+	System.out.print ("(assert ");
         pars += generateIntConsts (r, intConsts, numConsts, maxBW);
         pars += generateIntLayer (r, intNodes, intConsts, uFuncs, uPreds,
                                   linear, minRefs, false);
@@ -4723,7 +4741,7 @@ public class FuzzSMT {
           generateUPreds (r, sorts, uPreds, numUPreds, minArgs, maxArgs);
 
         generateRealVars (realNodes, numVars);
-        System.out.println (":formula");
+	System.out.print ("(assert ");
         pars += generateRealConstsNotFilledZero (r, intConstsAsReal, zeroConsts,
                                                  numConsts, maxBW, false);
         pars += generateRealLayer (r, realNodes, intConstsAsReal, zeroConsts, 
@@ -4745,7 +4763,7 @@ public class FuzzSMT {
         generateUVars  (sorts, nodes, numVars);
         generateUFuncs (r, sorts, uFuncs, minNumUFuncs, minArgs, maxArgs);
         generateUPreds (r, sorts, uPreds, minNumUPreds, minArgs, maxArgs);
-        System.out.println (":formula");
+	System.out.print ("(assert ");
         pars += generateUTermLayer (r, sorts, nodes, uFuncs, minRefs);
         pars += generateUPredLayer (r, nodes, boolNodes, uPreds, minRefs);
         pars += generateITELayer (r, nodes, boolNodes, 1); 
@@ -4786,6 +4804,7 @@ public class FuzzSMT {
       builder.append (")");
     builder.append ("\n");
     System.out.println(builder.toString());
+    System.out.println("(check-sat)");
     System.exit (0);
   }
 
