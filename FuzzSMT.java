@@ -1401,12 +1401,12 @@ public class FuzzSMT {
                 break;
               case 2:
                 builder.append (n1.getName());
-                builder.append (" (~ ");
+                builder.append (" (- ");
                 builder.append (n2.getName());
                 builder.append (")");
                 break;
               case 3:
-                builder.append ("(~ ");
+                builder.append ("(- ");
                 builder.append (n2.getName());
                 builder.append (") ");
                 builder.append (n1.getName());
@@ -1607,12 +1607,12 @@ public class FuzzSMT {
                 break;
               case 2:
                 builder.append (n1.getName());
-                builder.append (" (~ ");
+                builder.append (" (- ");
                 builder.append (n2.getName());
                 builder.append (")");
                 break;
               case 3:
-                builder.append ("(~ ");
+                builder.append ("(- ");
                 builder.append (n2.getName());
                 builder.append (") ");
                 builder.append (n1.getName());
@@ -1652,7 +1652,7 @@ public class FuzzSMT {
           if (r.nextBoolean()) {
             builder.append (c2.getName());
           } else {
-            builder.append ("(~ ");
+            builder.append ("(- ");
             builder.append (c2.getName());
             builder.append (")");
           }
@@ -2085,7 +2085,7 @@ public class FuzzSMT {
         builder.append (v2.getName());
         builder.append (") ");
         if (r.nextBoolean()) {
-          builder.append ("(~ ");
+          builder.append ("(- ");
           builder.append (c.getName());
           builder.append (")");
         } else {
@@ -2170,7 +2170,7 @@ public class FuzzSMT {
           builder.append (") ");
           if (r.nextBoolean()) {
             if (r.nextBoolean()) {
-              builder.append ("(~ ");
+              builder.append ("(- ");
               builder.append (c1.getName());
               builder.append (")");
             } else {
@@ -2186,7 +2186,7 @@ public class FuzzSMT {
             if (r.nextBoolean()) {
               builder.append (c2.getName());
             } else {
-              builder.append ("(~ ");
+              builder.append ("(- ");
               builder.append (c2.getName());
               builder.append (")");
             }
@@ -2218,7 +2218,7 @@ public class FuzzSMT {
 
         builder.append (")) ");
         if (r.nextBoolean()) {
-          builder.append ("(~ ");
+          builder.append ("(- ");
           builder.append (c1.getName());
           builder.append (")");
         } else {

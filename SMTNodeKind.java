@@ -81,7 +81,7 @@ public enum SMTNodeKind {
   DISTINCT("distinct", -1),
   /* interpreted functions */
   PLUS("+", 2),
-  UNMINUS("~", 1),
+  UNMINUS("-", 1),
   BINMINUS("-", 2),
   MUL("*", 2),
   DIV("/", 2),
