@@ -91,7 +91,11 @@ public enum SMTNodeKind {
   /* if-then-else on terms */
   ITE("ite", 3),
   UFUNC("extrafun", -1),
-  UPRED("extrapred", -1);
+  UPRED("extrapred", -1),
+  /* set operators */
+  UNION("union", 2),
+  INTERSECTION("intersection", 2),
+  SETMINUS("setminus", 2);
 
   protected String string;
 

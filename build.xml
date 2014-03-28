@@ -9,7 +9,7 @@
   </target>
 
   <target name="all" depends="init">
-    <javac debug="no" srcdir="${src}" destdir="${build}" includeantruntime="false"/>
+    <javac debug="true" srcdir="${src}" destdir="${build}" includeantruntime="false"/>
     <jar destfile="fuzzsmt.jar" basedir="${build}">
       <manifest>
         <attribute name="Main-Class" value="FuzzSMT"/>

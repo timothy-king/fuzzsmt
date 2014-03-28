@@ -3393,6 +3393,18 @@ public class FuzzSMT {
     int minNumUPredsArray2 = 0;
     int maxNumUPredsArray2 = 0;
     int numUPredsArray2 = 0;
+    int minNumSets = 0;
+    int maxNumSets = 0;
+    int numSets = 0;
+    int minNumMembers = 0;
+    int maxNumMembers = 0;
+    int numMembers = 0;
+    int minNumUFuncsSets = 0;
+    int maxNumUFuncsSets = 0;
+    int numUFuncsSets = 0;
+    int minNumUPredsSets = 0;
+    int maxNumUPredsSets = 0;
+    int numUPredsSets = 0;
     boolean linear = true;
     double factor = 1.0;
     RelCompMode compModeArray = RelCompMode.OFF;
@@ -3589,6 +3601,23 @@ public class FuzzSMT {
       case QF_UFNIA:
 	  System.out.println("QF_UFNIA is not an SMT-lib 2.0 category.");
 	  System.exit(0);
+      case QF_UFLIA_SETS:
+        minNumSets = 1;
+        maxNumSets = 3;
+        minNumMembers = 1;
+        maxNumMembers = 10;
+        minNumUFuncsInt = 1;
+        maxNumUFuncsInt = 1;
+        minNumUFuncsSets = 1;
+        maxNumUFuncsSets = 1;
+        minNumUPredsInt = 1;
+        maxNumUPredsInt = 1;
+        minNumUPredsSets = 1;
+        maxNumUPredsSets = 1;
+        minArgs = 1;
+        maxArgs = 3;
+        maxBW = 4;
+        break;
       case QF_UFNRA:
       case QF_UFLIA:
       case QF_UFLRA:
@@ -4187,6 +4216,52 @@ public class FuzzSMT {
         numUPredsArray = selectRandValRange (r, minNumUPredsArray, 
                                              maxNumUPredsArray);
         break;
+      case QF_UFLIA_SETS:
+        assert (minNumVars > 0);
+        assert (maxNumVars > 0);
+        assert (minNumConsts > 0);
+        assert (maxNumConsts > 0);
+        assert (minNumSets > 0);
+        assert (maxNumSets > 0);
+        assert (minNumMembers >= 0);
+        assert (maxNumMembers > 0);
+        assert (minNumUFuncsInt >= 0);
+        assert (maxNumUFuncsInt >= 0);
+        assert (minNumUFuncsSets >= 0);
+        assert (maxNumUFuncsSets >= 0);
+        assert (minNumUPredsInt >= 0);
+        assert (maxNumUPredsInt >= 0);
+        assert (minNumUPredsSets >= 0);
+        assert (maxNumUPredsSets >= 0);
+        assert (minArgs > 0);
+        assert (maxArgs > 0);
+        assert (maxBW > 0);
+        assert (linear);
+        checkMinMax (minNumVars, maxNumVars, "variables");
+        checkMinMax (minNumConsts, maxNumConsts, "constants");
+        checkMinMax (minNumArrays, maxNumArrays, "sets");
+        checkMinMax (minNumMembers, maxNumMembers, "members");
+        checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
+                     "uninterpreted int functions");
+        checkMinMax (minNumUFuncsArray, maxNumUFuncsArray, 
+                     "uninterpreted set functions");
+        checkMinMax (minNumUPredsInt, maxNumUPredsInt, 
+                     "uninterpreted int predicates");
+        checkMinMax (minNumUPredsArray, maxNumUPredsArray, 
+                     "uninterpreted set predicates");
+        checkMinMax (minArgs, maxArgs, "arguments");
+        numVars = selectRandValRange (r, minNumVars, maxNumVars);
+        numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
+        numSets = selectRandValRange (r, minNumSets, maxNumSets);
+        numMembers = selectRandValRange (r, minNumMembers, maxNumMembers);
+        numUFuncsInt = selectRandValRange (r, minNumUFuncsInt, maxNumUFuncsInt);
+        numUFuncsSets = selectRandValRange (r, minNumUFuncsSets, 
+                                             maxNumUFuncsSets);
+        numUPredsInt = selectRandValRange (r, minNumUPredsInt, maxNumUPredsInt);
+        numUPredsSets = selectRandValRange (r, minNumUPredsSets, 
+                                             maxNumUPredsSets);
+        break;
+
     }
     
 
@@ -4770,7 +4845,60 @@ public class FuzzSMT {
         pars += generateUPredLayer (r, nodes, boolNodes, uPreds, minRefs);
       }
       break;
-    }
+      case QF_UFLIA_SETS: {
+        ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
+        ArrayList<SMTType> sortsSet = new ArrayList<SMTType>();
+        ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
+        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+        ArrayList<SMTNode> sets = new ArrayList<SMTNode>();
+        ArrayList<UFunc> uFuncsInt = new ArrayList<UFunc>();
+        ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
+        ArrayList<UFunc> uFuncsSet = new ArrayList<UFunc>();
+        ArrayList<UPred> uPredsSet = new ArrayList<UPred>();
+        System.out.println ("(define-sort Element () Int)");
+
+        sortsInt.add (IntType.intType);
+        sortsSet.add (SetType.setType);
+
+        if (numUFuncsInt > 0)
+          generateUFuncs (r, sortsInt, uFuncsInt, numUFuncsInt, 
+                          minArgs, maxArgs);
+        if (numUFuncsSets > 0)
+          generateUFuncs (r, sortsSet, uFuncsSet, numUFuncsSets, 
+                          minArgs, maxArgs);
+ 
+        if (numUPredsInt > 0)
+          generateUPreds (r, sortsInt, uPredsInt, numUPredsInt, 
+                          minArgs, maxArgs);
+        if (numUPredsSets > 0)
+          generateUPreds (r, sortsSet, uPredsSet, numUPredsSets, 
+                          minArgs, maxArgs);
+
+        generateIntVars (intNodes, numVars);
+        generateVarsOfOneType (sets, numSets, SetType.setType);
+
+        System.out.print ("(assert ");
+        if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
+	    pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
+                               numQFormulasInt, minQVars, maxQVars, 
+                               minQNestings, maxQNestings, false, minRefs);
+
+        /* To add: if QFormulasSets > 0 */
+
+        pars += generateIntConsts (r, intConsts, numConsts, maxBW);
+        pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
+                                  true, minRefs, true);
+
+        if (numUFuncsSets > 0)
+          pars += generateUTermLayer (r, sortsSet, sets, uFuncsSet, 
+                                      minRefs);
+        pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
+                                         minRefs, RelCompMode.FULL, true);
+        pars += generateITELayer (r, sets, boolNodes, minRefs);
+        pars += generateITELayer (r, intNodes, boolNodes, minRefs);
+      }
+      break;
+    }/* switch */
 
     /* generate boolean layer */
     assert (boolNodes.size() > 0);

@@ -37,6 +37,7 @@ public enum SMTLogic
   QF_UFIDL,
   QF_UFLIA,
   QF_UFLRA,
+  QF_UFLIA_SETS,
   QF_UFNIA,
   QF_UFNRA,
   QF_UFRDL,
