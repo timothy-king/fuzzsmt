@@ -1294,6 +1294,36 @@ public class FuzzSMT {
     return numReads;
   }
 
+  private static int generateSetsMemberLayer(Random r, List<SMTNode> intNodes,
+                                             List<SMTNode> setNodes,
+                                             List<SMTNode> boolNodes, 
+                                             int numMembers){
+    String name;
+    SMTNode n1, n2;
+    StringBuilder builder = new StringBuilder();
+    int numMembers_ = numMembers;
+
+    while(numMembers > 0) {
+      name = "e" + SMTNode.getNodeCtr();
+      n1 = intNodes.get(r.nextInt(intNodes.size()));
+      n2 = setNodes.get(r.nextInt(setNodes.size()));
+      assert (n1.getType() == IntType.intType);
+      assert (n2.getType() == SetType.setType);
+      builder.append ("(let ((");
+      builder.append (name);
+      builder.append (" (");
+      builder.append ("in ");
+      builder.append (n1.getName());
+      builder.append (" ");
+      builder.append (n2.getName());
+      builder.append (")))\n");
+      boolNodes.add(new SMTNode (BoolType.boolType, name));
+      --numMembers;
+    }
+    System.out.print (builder.toString());
+    return numMembers_;
+  }
+
   private static int generateIntLayer (Random r, List<SMTNode> intNodes,
                                        List<SMTNode> intConsts, 
                                        List<UFunc> uFuncs, List<UPred> uPreds,
@@ -1487,7 +1517,7 @@ public class FuzzSMT {
           break;
       }
       builder.append (")))\n");
-        
+
       intNodes.add (new SMTNode (IntType.intType, name));
     }
     System.out.print (builder.toString());
@@ -4888,6 +4918,7 @@ public class FuzzSMT {
         pars += generateIntConsts (r, intConsts, numConsts, maxBW);
         pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
                                   true, minRefs, true);
+        pars += generateSetsMemberLayer(r, intNodes, sets, boolNodes, numMembers);
 
         if (numUFuncsSets > 0)
           pars += generateUTermLayer (r, sortsSet, sets, uFuncsSet, 
