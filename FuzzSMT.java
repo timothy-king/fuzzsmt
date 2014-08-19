@@ -490,7 +490,7 @@ public class FuzzSMT {
       types.add (new UType (name));
       builder.append ("(declare-sort ");
       builder.append (name);
-      builder.append (")\n");
+      builder.append (" 0)\n");
     }
     System.out.print (builder.toString());
     return numUTypes;
@@ -5102,7 +5102,7 @@ public class FuzzSMT {
     assert (boolNodes.size() == 1);
     assert (boolNodes.get(0).getType() == BoolType.boolType);
     if (bvDivMode == BVDivMode.GUARD && 
-        (logic == SMTLogic.QF_BV || logic == SMTLogic.QF_AUFBV)){
+        (logic == SMTLogic.QF_BV || logic == SMTLogic.QF_UFBV || logic == SMTLogic.QF_AUFBV)){
       assert (BVDivGuards != null);
       pars += addBVDivGuards (boolNodes, BVDivGuards);
       assert (boolNodes.size() == 1);
