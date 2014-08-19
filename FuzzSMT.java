@@ -1294,6 +1294,155 @@ public class FuzzSMT {
     return numReads;
   }
 
+  private static int generateSetsLayer (Random r, List<SMTNode> setNodes,
+                                        //List<SMTNode> setConsts,
+                                        List<UFunc> uFuncs, List<UPred> uPreds,
+                                        int minRefs, boolean noBlowup){
+    HashMap<SMTNode, Integer> todoSetNodes;
+    HashMap<UFunc, Integer> todoUFuncs;
+    HashMap<UPred, Integer> todoUPreds;
+    String name;
+    SMTNode n1, n2;
+    SMTNode []todoArray;
+    EnumSet<SMTNodeKind> kindSet;
+    SMTNodeKind [] kinds;
+    SMTNodeKind kind;
+    UFunc []todoUFuncsArray;
+    UPred []todoUPredsArray;
+    UFunc uFunc;
+    UPred uPred;
+    int oldSize, sizeOpTypes, sizeUFuncs, sizeUPreds;
+    Signature sig;
+    List<SMTType> operandTypes;
+    StringBuilder builder;
+
+    assert (uFuncs != null);
+    assert (uPreds != null);
+    assert (minRefs > 0);
+
+    kindSet = EnumSet.range (SMTNodeKind.UNION, SMTNodeKind.SETMINUS);
+
+    if(!uFuncs.isEmpty())
+      kindSet.add(SMTNodeKind.UFUNC);
+   if(!uPreds.isEmpty())
+     kindSet.add(SMTNodeKind.UPRED);
+    kinds = kindSet.toArray(new SMTNodeKind[0]);
+    todoSetNodes = new HashMap<SMTNode, Integer>();
+    for(int i = 0; i < setNodes.size(); i++)
+      todoSetNodes.put (setNodes.get(i), new Integer(0));
+
+    todoUFuncs = new HashMap< UFunc, Integer> ();
+    sizeUFuncs = uFuncs.size();
+    for (int i = 0; i < sizeUFuncs; i++)
+      todoUFuncs.put( uFuncs.get(i), new Integer(0));
+
+
+    todoUPreds = new HashMap<UPred, Integer>();
+    sizeUPreds = uPreds.size();
+    for (int i = 0; i < sizeUPreds; i++)
+        todoUPreds.put (uPreds.get(i), new Integer(0));
+
+    builder = new StringBuilder();
+    oldSize = setNodes.size();
+
+    while (!todoSetNodes.isEmpty() || //!todoSetConsts.isEmpty() ||
+           !todoUFuncs.isEmpty() || !todoUPreds.isEmpty()) {
+
+      name = "e" + SMTNode.getNodeCtr();
+      kind = kinds[r.nextInt(kinds.length)];
+      builder.append ("(let ((");
+      builder.append (name);
+      builder.append (" (");
+      if (noBlowup && r.nextBoolean() && !todoSetNodes.isEmpty()) {
+        todoArray = todoSetNodes.keySet().toArray (new SMTNode[0]);
+        n1 = todoArray[r.nextInt(todoArray.length)];
+      } else {
+        n1 = setNodes.get(r.nextInt(setNodes.size()));
+      }
+      assert (n1.getType() == SetType.setType);
+      switch (kind) {
+        case INTERSECTION:
+        case SETMINUS:
+        case UNION:
+          builder.append (kind.getString());
+          builder.append (" ");
+          n2 = setNodes.get(r.nextInt(setNodes.size()));
+          assert (n2.getType() == SetType.setType);
+          builder.append (n1.getName());
+          builder.append (" ");
+          builder.append (n2.getName());
+          updateNodeRefs (todoSetNodes, n1, minRefs);
+          updateNodeRefs (todoSetNodes, n2, minRefs);
+          break;
+        case UFUNC:
+          if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
+            todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
+            uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
+          } else {
+            uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
+          }
+          updateFuncRefs (todoUFuncs, uFunc, minRefs);
+          builder.append (uFunc.getName());
+          sig = uFunc.getSignature();
+          operandTypes = sig.getOperandTypes();
+          sizeOpTypes = operandTypes.size();
+          assert (sizeOpTypes > 0);
+          assert (operandTypes.get(0) == SetType.setType);
+          builder.append (" ");
+          builder.append (n1.getName());
+          updateNodeRefs (todoSetNodes, n1, minRefs);
+          for (int i = 1; i < sizeOpTypes; i++) {
+            n2 = setNodes.get(r.nextInt(setNodes.size()));
+            assert (n2.getType() == SetType.setType);
+            assert (operandTypes.get(i) == SetType.setType);
+            builder.append (" ");
+            builder.append (n2.getName());
+            updateNodeRefs (todoSetNodes, n2, minRefs);
+          }
+          assert (sig.getResultType() == SetType.setType);
+          break;
+        case UPRED:
+          if (!todoUPreds.isEmpty() && r.nextBoolean()) {
+            todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
+            uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
+          } else {
+            uPred = uPreds.get(r.nextInt(sizeUPreds));
+          }
+          updatePredRefs (todoUPreds, uPred, minRefs);
+          builder.append ("ite (");
+          builder.append (uPred.getName());
+          sig = uPred.getSignature();
+          operandTypes = sig.getOperandTypes();
+          sizeOpTypes = operandTypes.size();
+          assert (sizeOpTypes > 0);
+          assert (operandTypes.get(0) == SetType.setType);
+          builder.append (" ");
+          builder.append (n1.getName());
+          updateNodeRefs (todoSetNodes, n1, minRefs);
+          for (int i = 1; i < sizeOpTypes; i++) {
+            n2 = setNodes.get(r.nextInt(setNodes.size()));
+            assert (n2.getType() == SetType.setType);
+            assert (operandTypes.get(i) == SetType.setType);
+            builder.append (" ");
+            builder.append (n2.getName());
+            updateNodeRefs (todoSetNodes, n2, minRefs);
+          }
+          builder.append (") (setenum 1) (setenum 0)");
+          assert (sig.getResultType() == BoolType.boolType);
+          break;
+        default:
+          break;
+      }
+      builder.append (")))\n");
+
+      setNodes.add (new SMTNode (SetType.setType, name));
+
+    }
+    System.out.print(builder.toString());
+
+    return setNodes.size() - oldSize;
+  }
+
   private static int generateSetsMemberLayer(Random r, List<SMTNode> intNodes,
                                              List<SMTNode> setNodes,
                                              List<SMTNode> boolNodes, 
@@ -3633,9 +3782,9 @@ public class FuzzSMT {
 	  System.exit(0);
       case QF_UFLIA_SETS:
         minNumSets = 1;
-        maxNumSets = 3;
+        maxNumSets = 5;
         minNumMembers = 1;
-        maxNumMembers = 10;
+        maxNumMembers = 30;
         minNumUFuncsInt = 1;
         maxNumUFuncsInt = 1;
         minNumUFuncsSets = 1;
@@ -4269,7 +4418,7 @@ public class FuzzSMT {
         assert (linear);
         checkMinMax (minNumVars, maxNumVars, "variables");
         checkMinMax (minNumConsts, maxNumConsts, "constants");
-        checkMinMax (minNumArrays, maxNumArrays, "sets");
+        checkMinMax (minNumSets, maxNumSets, "sets");
         checkMinMax (minNumMembers, maxNumMembers, "members");
         checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
                      "uninterpreted int functions");
@@ -4918,7 +5067,10 @@ public class FuzzSMT {
         pars += generateIntConsts (r, intConsts, numConsts, maxBW);
         pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
                                   true, minRefs, true);
-        pars += generateSetsMemberLayer(r, intNodes, sets, boolNodes, numMembers);
+        pars += generateSetsLayer (r, sets, uFuncsSet, uPredsSet, minRefs,
+                                   true);
+        pars += generateSetsMemberLayer(r, intNodes, sets, boolNodes,
+                                        numMembers);
 
         if (numUFuncsSets > 0)
           pars += generateUTermLayer (r, sortsSet, sets, uFuncsSet, 
