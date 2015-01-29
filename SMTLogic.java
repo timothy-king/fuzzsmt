@@ -26,6 +26,7 @@ public enum SMTLogic
   QF_BV,
   QF_AUFBV,
   QF_AUFLIA,
+	QF_FP,
   QF_IDL,
   QF_LIA,
   QF_LRA,

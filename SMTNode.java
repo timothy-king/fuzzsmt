@@ -49,4 +49,7 @@ public class SMTNode
     return nodeCtr;
   }
 
+  public String toString() {
+    return "("+ name.toString() +" "+ type.toString()+")";
+  }
 }

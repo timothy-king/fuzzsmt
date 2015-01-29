@@ -22,9 +22,9 @@ import java.math.*;
 
 public class FuzzSMT {
 
-/*----------------------------------------------------------------------------*/
-/* Auxillary                                                                  */
-/*----------------------------------------------------------------------------*/
+	/*----------------------------------------------------------------------------*/
+	/* Auxillary                                                                  */
+	/*----------------------------------------------------------------------------*/
 
   private enum BVDivMode {
     OFF,
@@ -123,6 +123,32 @@ public class FuzzSMT {
     }
   }
 
+  private static FloatingPointType agreeOnFloatingPointType(Random r, Range expRange, Range sigRange, SMTNode x, SMTNode y){
+    FloatingPointType xType;
+    FloatingPointType yType;
+    
+    assert (r != null);
+    assert (expRange != null);
+    assert (sigRange != null);
+    assert (x.getType() instanceof FloatingPointType);
+    assert (y.getType() instanceof FloatingPointType);
+    xType = (FloatingPointType) x.getType();
+    yType = (FloatingPointType) y.getType();
+
+    // Be biased towards selecting the dominant type
+    if ( r.nextBoolean() ){
+      return xType.dominantType(yType);
+    } else if (r.nextBoolean()){
+      if (r.nextBoolean()){
+        return xType;
+      } else {
+        return yType;
+      }
+    } else {
+      return randomFloatingPointType(r, expRange, sigRange);
+    }
+  }
+  
   private static String wrapEqualBW (Random r, SMTNode n1, SMTNode n2){
     int n1bw;
     int n2bw;
@@ -213,9 +239,9 @@ public class FuzzSMT {
     return builder.toString();
   }
 
-/*----------------------------------------------------------------------------*/
-/* Input Layer                                                                */
-/*----------------------------------------------------------------------------*/
+	/*----------------------------------------------------------------------------*/
+	/* Input Layer                                                                */
+	/*----------------------------------------------------------------------------*/
 
   private static int generateVarsOfOneType (List<SMTNode> nodes, int numVars, 
                                             SMTType type){
@@ -273,6 +299,736 @@ public class FuzzSMT {
     return numVars;
   }
 
+	/* Randomly shuffle arr from [start, end) s.t. the subrange [start,start+k)
+   * is an randomly selected subset of [start, end).
+   * This is an implementation of Fisher–Yates.
+   */
+  private static <T> void shuffleSubrange(Random r, T[] arr, int start, int end, int k){
+		assert(r != null);
+		assert(arr != null);
+		assert(end <= arr.length);
+		assert(start+k <= end);
+
+		int selection;
+		for (int remaining = k, next=start; remaining > 0; remaining--, next++){
+			selection = next + r.nextInt(remaining);
+			// swap selection and next
+			T tmp = arr[selection]; arr[selection] = arr[next]; arr[next] = tmp;
+		}
+  }
+
+  private static int generateFPRoundingModes (Random r, List<SMTNode> nodes, int numModes){
+		final EnumSet<SMTNodeKind> roundingModes =
+      EnumSet.range (SMTNodeKind.ROUNDNEARESTTIESTOEVEN, SMTNodeKind.RTZ);
+		SMTNodeKind[] rms = roundingModes.toArray(new SMTNodeKind[0]);
+		String name;
+		SMTNode node;
+		StringBuilder builder;
+
+    RoundingModeType rmty;
+    
+		assert (r != null);
+    assert (1 <= numModes && numModes <= rms.length);
+    
+		shuffleSubrange(r, rms, 0, rms.length, numModes);
+
+    rmty = new RoundingModeType();
+		builder = new StringBuilder();
+		for (int i = 0; i < numModes; i++) {
+			name = "rm" + SMTNode.getNodeCtr();
+			builder.append ("(let ((");
+			builder.append (name);
+			builder.append (' ');
+			builder.append (rms[i].getString());
+			builder.append ("))\n");
+			node = new SMTNode (rmty, name);
+			nodes.add (node);
+		}
+		System.out.print (builder.toString());
+
+		return numModes;	
+  }
+
+
+  private static int generateFPVars (Random r, List<SMTNode> nodes, int numVars, Range expRange, Range sigRange){
+		int expw;
+		int sigw;
+		String name;
+		SMTNode node;
+		StringBuilder builder;
+
+		FloatingPointType fpty;
+
+		assert (r != null);
+		assert (nodes != null);
+		assert (numVars >= 0);
+    
+    assert (expRange != null);
+    assert (expRange.smallNonemptyAbove(2));
+
+    assert (sigRange != null);
+    assert (sigRange.smallNonemptyAbove(2));
+
+		builder = new StringBuilder();
+		for (int i = 0; i < numVars; i++) {
+			expw = expRange.selectRandom(r);
+			sigw = sigRange.selectRandom(r);
+			name = "v" + SMTNode.getNodeCtr();
+
+			fpty = new FloatingPointType(expw, sigw);
+
+			builder.append ("(declare-fun ");
+			builder.append (name);
+			builder.append (" () ");
+			builder.append (fpty.toString());
+			builder.append (")\n");
+			node = new SMTNode (fpty, name);
+			nodes.add (node);
+		}
+		System.out.print (builder.toString());
+
+		return numVars;
+	}
+
+
+	private static String bvConstStr(BigInteger bi, int width){
+		assert(bi.bitLength() <= width);
+		assert(bi.signum() >= 0);
+		return "(_ bv"+bi.toString()+" "+width+")";
+	}
+
+  private static int generateFPComparisons (Random r,
+                                            List<SMTNode> fpNodes, List<SMTNode> boolNodes, List<SMTNode> roundingModes,
+                                            int minRefs, Range expRange, Range sigRange){
+    SMTNodeKind kind;
+    EnumSet<SMTNodeKind> kindSet;
+    SMTNodeKind [] kinds;
+    String name;
+    HashMap<SMTNode, Integer> todoNodes;
+    StringBuilder builder;
+    SMTNode n1, n2;
+    SMTNode rm1, rm2;
+    FloatingPointType resType;
+    int oldSize;
+    
+    assert (r != null);
+    assert (fpNodes != null);
+    assert (!fpNodes.isEmpty());
+    assert (boolNodes != null);
+    assert (roundingModes != null);
+    assert (!roundingModes.isEmpty());
+    assert (minRefs > 0);
+    assert (expRange != null);
+    assert (!expRange.isEmpty());
+    assert (sigRange != null);
+    assert (!sigRange.isEmpty());
+    assert (SMTNodeKind.FPLEQ.ordinal() < SMTNodeKind.FPISPOSITIVE.ordinal());
+
+    kindSet = EnumSet.range (SMTNodeKind.FPLEQ, SMTNodeKind.FPISPOSITIVE);
+    kindSet.add (SMTNodeKind.EQ);
+    kindSet.add (SMTNodeKind.DISTINCT);
+    
+    kinds = kindSet.toArray(new SMTNodeKind[0]);
+
+    todoNodes = new HashMap<SMTNode, Integer>();
+    for (int i = 0; i < fpNodes.size(); i++){
+      todoNodes.put (fpNodes.get(i), new Integer(0));
+    }
+    
+    builder = new StringBuilder();
+    oldSize = boolNodes.size();
+    
+    while (!todoNodes.isEmpty()){
+			name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
+      builder.append (name);
+      builder.append (" ");
+      
+      kind = randomElement(r, kinds);
+      assert(kind.arity == 1 || kind.arity == 2 || kind.arity == SMTNodeKind.NARY);
+
+      builder.append ("(");
+      builder.append(kind.getString());
+      builder.append(" ");
+      
+      n1 = randomElement(r, fpNodes);
+      assert (n1.getType() instanceof FloatingPointType);
+
+      if (kind.arity == 1) {
+        builder.append(n1.getName());
+        updateNodeRefs (todoNodes, n1, minRefs);
+      } else {
+        assert(kind.arity == 2 || kind.arity == SMTNodeKind.NARY);
+
+        n2 = randomElement(r, fpNodes);
+        assert (n2.getType() instanceof FloatingPointType);
+
+        rm1 = randomElement(r, roundingModes);
+        assert (rm1.getType() instanceof RoundingModeType);
+        rm2 = randomElement(r, roundingModes);
+        assert (rm2.getType() instanceof RoundingModeType);
+          
+        resType = agreeOnFloatingPointType(r, expRange, sigRange, n1, n2);
+
+        // System.out.println();
+        // System.out.println(name);
+        // System.out.println(fpToFpIfNeeded(resType, n1, rm1) +" "+n1.getType());
+        // System.out.println(fpToFpIfNeeded(resType, n2, rm1) +" "+n2.getType());
+        // System.out.println(resType);
+
+        
+        builder.append ( fpToFpIfNeeded(resType, n1, rm1) );
+        builder.append (" ");
+        builder.append ( fpToFpIfNeeded(resType, n2, rm2) );
+        updateNodeRefs (todoNodes, n1, minRefs);
+        updateNodeRefs (todoNodes, n2, minRefs);
+        // RESUME add updateNodeRefs elsewhere
+      }
+      builder.append(")");
+      builder.append ("))\n");
+      boolNodes.add (new SMTNode (BoolType.boolType, name));
+    }
+
+    System.out.print (builder.toString());
+    assert (boolNodes.size() - oldSize > 0);
+    return boolNodes.size() - oldSize;
+  }
+                                              
+  private static int generateFPLayer (Random r, List<SMTNode> fpNodes, List<SMTNode> roundingModes,
+																			boolean noBlowup, int minRefs, Range expRange, Range sigRange){
+
+		int oldSize;
+		EnumSet<SMTNodeKind> kindSet;
+    SMTNodeKind []kinds;
+    SMTNodeKind kind;
+    
+    HashMap<SMTNode, Integer> todoNodes;
+    SMTNode[] todoNodesArray;
+		String name;
+		StringBuilder builder;
+
+
+    SMTNode rm1;
+    SMTNode rm2;
+    SMTNode rm3;
+    SMTNode rm4;
+    SMTNode n1;
+    SMTNode n2;
+    SMTNode n3;
+    SMTNode n4;
+    FloatingPointType n1Type;
+    FloatingPointType n2Type;
+    FloatingPointType n3Type;
+    FloatingPointType n4Type;
+    FloatingPointType predType;
+    FloatingPointType resType;
+
+    FloatingPointType maxType;
+    maxType = new FloatingPointType(expRange.getMax(), sigRange.getMax());
+    
+		assert (r != null );
+		assert (fpNodes != null);
+		assert (!fpNodes.isEmpty());
+		assert (roundingModes != null);
+		assert (!roundingModes.isEmpty());
+		assert (SMTNodeKind.FPABS.ordinal() < SMTNodeKind.FPMAX.ordinal());
+
+    assert (expRange != null );
+    assert (expRange.smallNonemptyAbove(2) );
+    assert (sigRange != null );
+    assert (sigRange.smallNonemptyAbove(2) );
+    
+		kindSet = EnumSet.range (SMTNodeKind.FPABS, SMTNodeKind.FPISPOSITIVE);
+		kindSet.add (SMTNodeKind.FPTOFP);
+		kindSet.add (SMTNodeKind.EQ);
+    kindSet.add (SMTNodeKind.DISTINCT);
+	
+    kinds = kindSet.toArray(new SMTNodeKind[0]);	
+		oldSize = fpNodes.size();
+		todoNodes = new HashMap<SMTNode, Integer>();
+    for (int i = 0; i < oldSize; i++){
+      todoNodes.put (fpNodes.get(i), new Integer(0));
+		}
+    
+		builder = new StringBuilder();
+		while (!todoNodes.isEmpty()){
+			name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
+      builder.append (name);
+      builder.append (" ");
+      // no hanging paren like generateBVLayer does
+      
+      kind = randomElement(r, kinds);
+
+      if (noBlowup && r.nextBoolean() && !todoNodes.isEmpty()) { 
+        todoNodesArray = todoNodes.keySet().toArray(new SMTNode[0]);
+        n1 = randomElement(r, todoNodesArray);
+      } else {
+        n1 = randomElement(r, fpNodes);
+      }
+      
+      assert (n1.getType() instanceof BVType);
+      n1Type = ((FloatingPointType) n1.getType());
+
+      
+      switch (kind.arity) {
+			case 1:
+        switch(kind){
+        case FPISNORMAL:
+        case FPISSUBNORMAL:
+        case FPISZERO:
+        case FPISINFINITE:
+        case FPISNAN:
+        case FPISNEGATIVE:
+        case FPISPOSITIVE:
+          rm1 = randomElement(r, roundingModes);
+          assert (rm1.getType() instanceof RoundingModeType);
+          rm2 = randomElement(r, roundingModes);
+          assert (rm2.getType() instanceof RoundingModeType);
+
+          n2 = randomElement(r, fpNodes);
+          assert (n2.getType() instanceof FloatingPointType);
+          n3 = randomElement(r, fpNodes);
+          assert (n3.getType() instanceof FloatingPointType);
+          resType = agreeOnFloatingPointType(r, expRange, sigRange, n2, n3);
+
+          /* encode boolean results via ite */
+          builder.append ("(ite (");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append ( n1.getName() );
+          builder.append (") ");
+          // " (ite (<kind> <n1.getName()>) <n2> <n3>)"
+          builder.append ( fpToFpIfNeeded(resType, n2, rm1) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n3, rm2) );
+          builder.append (")");
+          
+          updateNodeRefs (todoNodes, n1, minRefs);
+          updateNodeRefs (todoNodes, n2, minRefs);
+          updateNodeRefs (todoNodes, n3, minRefs);
+          break;
+          
+        case FPABS:
+        case FPNEGATION:
+          resType = n1Type;
+          
+          builder.append ("(");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append (n1.getName());
+          builder.append (")");
+
+          updateNodeRefs (todoNodes, n1, minRefs);
+          break;
+        default:
+          printErrAndExit("Unreachable: generating unary floating point function");
+          resType = null;
+          break;
+        }
+        break;
+      case 2:
+        switch(kind){
+        case FPLEQ:
+        case FPLT:
+        case FPGEQ:
+        case FPGT:
+        case FPEQ:
+        case EQ:
+    
+          rm1 = randomElement(r, roundingModes);
+          assert (rm1.getType() instanceof RoundingModeType);
+          rm2 = randomElement(r, roundingModes);
+          assert (rm2.getType() instanceof RoundingModeType);
+          rm3 = randomElement(r, roundingModes);
+          assert (rm3.getType() instanceof RoundingModeType);
+          rm4 = randomElement(r, roundingModes);
+          assert (rm4.getType() instanceof RoundingModeType);
+
+          n2 = randomElement(r, fpNodes);
+          assert (n2.getType() instanceof FloatingPointType);
+          n3 = randomElement(r, fpNodes);
+          assert (n3.getType() instanceof FloatingPointType);
+          n4 = randomElement(r, fpNodes);
+          assert (n4.getType() instanceof FloatingPointType);
+          
+          predType = agreeOnFloatingPointType(r, expRange, sigRange, n1, n2);
+          resType = agreeOnFloatingPointType(r, expRange, sigRange, n3, n4);
+          /* encode boolean results via ite */
+          builder.append ("(ite (");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(predType, n1, rm1) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(predType, n2, rm2) );
+          builder.append (") ");
+          // " (ite (<kind> <n1> <n2>) <n3> <n4>)"
+          builder.append ( fpToFpIfNeeded(resType, n2, rm3) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n3, rm4) );
+          builder.append (")");
+          updateNodeRefs (todoNodes, n1, minRefs);
+          updateNodeRefs (todoNodes, n2, minRefs);
+          updateNodeRefs (todoNodes, n3, minRefs);
+          updateNodeRefs (todoNodes, n4, minRefs);
+          break;
+
+        case FPSQRT:
+          // (fp.sqrt RoundingMode (_ FloatingPoint eb sb) (_ FloatingPoint eb sb))
+        case FPROUNDTOINTEGRAL:
+          // (fp.roundToIntegral RoundingMode (_ FloatingPoint eb sb) (_ FloatingPoint eb sb))
+          rm1 = randomElement(r, roundingModes);
+          resType = n1Type;
+          builder.append ("(");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append (rm1.getName());
+          builder.append (" ");
+          builder.append (n1.getName());
+          builder.append (")");
+          updateNodeRefs (todoNodes, n1, minRefs);
+          break;
+          
+        case FPTOFP:
+          /* ((_ to_fp eb sb) RoundingMode (_ FloatingPoint mb nb) (_ FloatingPoint eb sb))*/
+          rm1 = randomElement(r, roundingModes);
+          resType = randomFloatingPointType(r, expRange, sigRange);
+          builder.append (fpToFpString(resType, n1, rm1));
+          updateNodeRefs (todoNodes, n1, minRefs);
+          break;
+          
+        case FPREM:
+          //(fp.rem (_ FloatingPoint eb sb) (_ FloatingPoint eb sb) (_ FloatingPoint eb sb))
+        case FPMIN:
+          //(fp.min (_ FloatingPoint eb sb) (_ FloatingPoint eb sb) (_ FloatingPoint eb sb)) 
+        case FPMAX:
+          //(fp.max (_ FloatingPoint eb sb) (_ FloatingPoint eb sb) (_ FloatingPoint eb sb))
+          
+          rm1 = randomElement(r, roundingModes);
+          rm2 = randomElement(r, roundingModes);
+          n2 = randomElement(r, fpNodes);
+          
+          assert (rm1 != null && rm1.getType() instanceof RoundingModeType);
+          assert (rm2 != null && rm2.getType() instanceof RoundingModeType);
+          assert (n2 != null && n2.getType() instanceof FloatingPointType);
+          
+          resType = agreeOnFloatingPointType(r, expRange, sigRange, n1, n2);
+          assert (resType != null && rm2.getType() instanceof RoundingModeType);
+          
+          builder.append ("(");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n1, rm1) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n2, rm2) );
+          builder.append (")");
+          updateNodeRefs (todoNodes, n1, minRefs);
+          updateNodeRefs (todoNodes, n2, minRefs);
+          break;
+
+        default:
+          printErrAndExit("Unreachable: generating binary floating point function");
+          resType = null;
+          break;
+        }
+        break;
+      case 3:
+        switch(kind){
+        case FPADD:
+        case FPSUB:
+        case FPMUL:
+        case FPDIV:
+          //(fp.X RoundingMode (_ FloatingPoint eb sb) (_ FloatingPoint eb sb) (_ FloatingPoint eb sb))
+          
+          rm1 = randomElement(r, roundingModes);
+          rm2 = randomElement(r, roundingModes);
+          rm3 = randomElement(r, roundingModes);
+
+          n2 = randomElement(r, fpNodes);
+
+          assert (rm1 != null && rm1.getType() instanceof RoundingModeType);
+          assert (rm2 != null && rm2.getType() instanceof RoundingModeType);
+          assert (rm3 != null && rm3.getType() instanceof RoundingModeType);
+          assert (n2 != null && n2.getType() instanceof FloatingPointType);
+
+          resType = agreeOnFloatingPointType(r, expRange, sigRange, n1, n2);
+          assert (resType != null && rm2.getType() instanceof RoundingModeType);
+          
+          builder.append ("(");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append (rm3.getName());
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n1, rm1) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n2, rm2) );
+          builder.append (")");
+          updateNodeRefs (todoNodes, n1, minRefs);
+          updateNodeRefs (todoNodes, n2, minRefs);
+          break;
+        default:
+          printErrAndExit("Unreachable: generating trinary floating point function");
+          resType = null;
+          break;
+        }
+        break;
+      case 4:
+        switch(kind){
+        case FPFMA:
+          //(fp.fma RoundingMode (_ FloatingPoint eb sb) (_ FloatingPoint eb sb) (_ FloatingPoint eb sb) (_ FloatingPoint eb sb))
+          rm1 = randomElement(r, roundingModes);
+          rm2 = randomElement(r, roundingModes);
+          rm3 = randomElement(r, roundingModes);
+          rm4 = randomElement(r, roundingModes);
+          
+          n2 = randomElement(r, fpNodes);
+          n3 = randomElement(r, fpNodes);
+          
+          assert (rm1 != null && rm1.getType() instanceof RoundingModeType);
+          assert (rm2 != null && rm2.getType() instanceof RoundingModeType);
+          assert (rm3 != null && rm3.getType() instanceof RoundingModeType);
+          assert (rm4 != null && rm4.getType() instanceof RoundingModeType);
+          assert (n2 != null && n2.getType() instanceof FloatingPointType);
+          assert (n3 != null && n3.getType() instanceof FloatingPointType);
+
+          resType = agreeOnFloatingPointType(r, expRange, sigRange, n1, n2);
+          assert (resType != null && rm2.getType() instanceof RoundingModeType);
+          
+          builder.append ("(");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append (rm4.getName());
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n1, rm1) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n2, rm2) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n3, rm3) );
+          builder.append (")");
+          
+          updateNodeRefs (todoNodes, n1, minRefs);
+          updateNodeRefs (todoNodes, n2, minRefs);
+          updateNodeRefs (todoNodes, n3, minRefs);
+          break;
+        default:
+          printErrAndExit("Unreachable: generating trinary floating point function");
+          resType = null;
+          break;
+        }
+        break;
+
+      case SMTNodeKind.NARY: /* n-ary */
+        switch(kind){
+        case DISTINCT:
+          rm1 = randomElement(r, roundingModes);
+          assert (rm1.getType() instanceof RoundingModeType);
+          rm2 = randomElement(r, roundingModes);
+          assert (rm2.getType() instanceof RoundingModeType);
+          rm3 = randomElement(r, roundingModes);
+          assert (rm3.getType() instanceof RoundingModeType);
+          rm4 = randomElement(r, roundingModes);
+          assert (rm4.getType() instanceof RoundingModeType);
+
+          n2 = randomElement(r, fpNodes);
+          assert (n2.getType() instanceof FloatingPointType);
+          n3 = randomElement(r, fpNodes);
+          assert (n3.getType() instanceof FloatingPointType);
+          n4 = randomElement(r, fpNodes);
+          assert (n4.getType() instanceof FloatingPointType);
+          
+          predType = agreeOnFloatingPointType(r, expRange, sigRange, n1, n2);
+          resType = agreeOnFloatingPointType(r, expRange, sigRange, n2, n3);
+          /* encode boolean results via ite */
+          builder.append ("(ite (");
+          builder.append (kind.getString());
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(predType, n1, rm1) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(predType, n2, rm2) );
+          builder.append (") ");
+          // " (ite (<kind> <n1> <n2>) <n3> <n4>)"
+          builder.append ( fpToFpIfNeeded(resType, n2, rm3) );
+          builder.append (" ");
+          builder.append ( fpToFpIfNeeded(resType, n3, rm4) );
+          builder.append (")");
+          updateNodeRefs (todoNodes, n1, minRefs);
+          updateNodeRefs (todoNodes, n2, minRefs);
+          updateNodeRefs (todoNodes, n3, minRefs);
+          updateNodeRefs (todoNodes, n4, minRefs);
+          break;
+        default:
+          printErrAndExit("Unreachable: generating nary fp function");
+          resType = null;
+          break; 
+        }
+        break;
+      default:
+        printErrAndExit("Unreachable: generating kind("+kind+") with the wrong arity("+kind.arity+")");
+        resType = null;
+        break;
+      }
+      
+      builder.append ("))\n");
+      assert (maxType.dominates(resType));
+      fpNodes.add (new SMTNode (resType, name));
+		}
+    System.out.print (builder.toString());
+    assert (fpNodes.size() - oldSize > 0);
+    return fpNodes.size() - oldSize;
+	}
+
+  private static <T> T randomElement(Random r, T[] arr){
+    assert (r!=null);
+    assert (arr!=null);
+    assert (arr.length >= 1);
+    return arr[r.nextInt (arr.length)];
+  }
+
+  private static <T> T randomElement(Random r, List<T> list){
+    assert (r!=null);
+    assert (list != null);
+    assert (list.size() >= 1);
+    return list.get(r.nextInt (list.size()));
+  }
+
+  private static String fpToFpString(FloatingPointType resType, SMTNode n, SMTNode rm){
+    //((_ to_fp eb sb) RoundingMode (_ FloatingPoint mb nb) (_ FloatingPoint eb sb))
+    StringBuilder builder;
+    builder = new StringBuilder();
+    builder.append("(");
+    builder.append(SMTNodeKind.FPTOFP.getString());
+    builder.append(" ");
+    builder.append(resType.getExponentWidth());
+    builder.append(" ");
+    builder.append(resType.getSignificandWidth());
+    builder.append(") "); // close parametric operator
+    builder.append(rm.getName());
+    builder.append(" ");
+    builder.append(n.getName());
+    builder.append(")");
+
+    return builder.toString();
+  }
+  
+  private static String fpToFpIfNeeded(FloatingPointType resType, SMTNode n, SMTNode rm){
+    FloatingPointType nType;
+    
+    assert ( resType != null );
+    assert ( n != null );
+    assert ( n.getType() instanceof FloatingPointType);
+    assert ( rm.getType() instanceof RoundingModeType);
+
+    nType = (FloatingPointType) n.getType();
+
+    if(resType.equals(nType)){
+      return n.getName();
+    } else {
+      return fpToFpString(resType, n, rm);
+    }
+  }
+  
+  private static int generateFPConsts (Random r, List<SMTNode> nodes,
+                                       int numConsts, Range expRange, Range sigRange){
+		int size;
+    int expw;
+    int sigw;
+    String name;
+    SMTNode node;
+    SMTNodeKind kind;
+    BigInteger exp;
+    BigInteger sig;
+    BigInteger sign;
+    StringBuilder builder;
+    FloatingPointType fpty;
+
+    
+    assert (r != null);
+    assert (nodes != null);
+    assert (expRange != null );
+    assert (expRange.smallNonemptyAbove(2) );
+    assert (sigRange != null );
+    assert (sigRange.smallNonemptyAbove(2) );
+    assert (numConsts >= 0);
+   
+
+    builder = new StringBuilder();
+    size = nodes.size();
+    for (int i = 0; i < numConsts; i++) {
+      fpty = randomFloatingPointType(r, expRange, sigRange);
+      expw = fpty.getExponentWidth();
+      sigw = fpty.getSignificandWidth();      
+
+
+      switch(r.nextInt(5+20)){// The 20 is the bias towards selecting fp
+      case 0:  kind = SMTNodeKind.FPPOSINFINITY; break;
+      case 1:  kind = SMTNodeKind.FPNEGINFINITY; break;
+      case 2:  kind = SMTNodeKind.FPPOSZERO; break;
+      case 3:  kind = SMTNodeKind.FPNEGZERO; break;
+      case 4:  kind = SMTNodeKind.FPNAN; break;
+      default: kind = SMTNodeKind.FPCONST; break;
+      }
+      
+      name = "e" + SMTNode.getNodeCtr();
+      builder.append ("(let ((");
+      builder.append (name);
+      builder.append (" ");
+      switch(kind){
+      case FPPOSINFINITY:
+      case FPNEGINFINITY:
+      case FPPOSZERO:
+      case FPNEGZERO:
+      case FPNAN:
+        builder.append (kind.getString());
+        builder.append (" ");
+        builder.append (expw);
+        builder.append (" ");
+        builder.append (sigw);
+        builder.append (")");
+        break;
+      case FPCONST:
+        exp = new BigInteger(expw, r);
+        sig = new BigInteger(sigw-1, r);
+        sign = new BigInteger(1, r);
+
+        // The "sigw+1" is because of the following in the standard:
+        //
+        // ; FP literals as bit string triples, with the leading bit for the significand
+        // ; not represented (hidden bit)
+        // :funs_description "All function symbols with declaration of the form
+        //   (fp (_ BitVec 1) (_ BitVec eb) (_ BitVec i) (_ FloatingPoint eb sb))
+        //   where eb and sb are numerals greater than 1 and i = sb - 1."
+
+        builder.append ("(");
+        builder.append (kind.getString());
+        builder.append (" ");
+        builder.append (bvConstStr(sign, 1));
+        builder.append (" ");
+        builder.append (bvConstStr(exp, expw));
+        builder.append (" ");
+        builder.append (bvConstStr(sig, sigw-1));
+        builder.append (")");
+        break;
+      default:
+        printErrAndExit ("Unreachable: selected a bad kind during fp constant generation");
+        break;
+      }
+      builder.append ("))\n");
+      node = new SMTNode (fpty, name);
+      nodes.add (node);
+    }
+    System.out.print (builder.toString());
+
+    return numConsts;
+  }
+
+  private static FloatingPointType randomFloatingPointType(Random r, Range expRange, Range sigRange){
+    int expw;
+    int sigw;
+    expw = expRange.selectRandom (r);
+    sigw = sigRange.selectRandom (r);
+    return new FloatingPointType (expw, sigw);
+  }
+
   private static int generateBVConsts (Random r, List<SMTNode> nodes,
                                        int numConsts, int minBW, int maxBW) {
     int bw;
@@ -298,11 +1054,8 @@ public class FuzzSMT {
       bi = new BigInteger(bw, r);
       builder.append ("(let ((");
       builder.append (name);
-      builder.append ("(_ bv");
-      builder.append (bi.toString());
-      builder.append (" ");
-      builder.append (bw);
-      builder.append (")))\n");
+			builder.append ( bvConstStr(bi, bw) );
+      builder.append ("))\n");
       node = new SMTNode (new BVType (bw), name);
       nodes.add (node);
     }
@@ -732,9 +1485,9 @@ public class FuzzSMT {
     return numPreds;
   }
 
-/*----------------------------------------------------------------------------*/
-/* Main layer                                                                 */
-/*----------------------------------------------------------------------------*/
+	/*----------------------------------------------------------------------------*/
+	/* Main layer                                                                 */
+	/*----------------------------------------------------------------------------*/
 
   private static int generateBVLayer (Random r,  List<SMTNode> nodes,
                                       int minRefs, int minBW, int maxBW,
@@ -834,243 +1587,243 @@ public class FuzzSMT {
       assert (n1.getType() instanceof BVType);
       n1BW = ((BVType) n1.getType()).width;
       switch (kind.arity) {
-        case 1:
-          builder.append (kind.getString());
-          switch (kind) {
-            case BVNOT:
-            case BVNEG:
-              builder.append (" ");
-              resBW = n1BW;
-              break;
-            case EXTRACT:
-              upper = r.nextInt(n1BW);
-              lower = r.nextInt (upper + 1);
-              builder.append (" ");
-              builder.append (upper);
-              builder.append (" ");
-              builder.append (lower);
-              builder.append (") ");
-              resBW = upper - lower + 1;
-              break;
-            case ROTATE_LEFT:
-            case ROTATE_RIGHT:
-              rotate = r.nextInt(n1BW);
-              builder.append (" ");
-              builder.append (rotate);
-              builder.append (") ");
-              resBW = n1BW;
-              break;
-            case ZERO_EXTEND:
-            case SIGN_EXTEND:
-              ext = r.nextInt(maxBW - n1BW + 1);
-              builder.append (" ");
-              builder.append (ext);
-              builder.append (") ");
-              resBW = n1BW + ext;
-              break;
-            default:
-              assert (kind == SMTNodeKind.REPEAT);
-              maxRep = maxBW / n1BW;
-              rep = r.nextInt(maxRep) + 1;
-              builder.append (" ");
-              builder.append (rep);
-              builder.append (") ");
-              resBW = n1BW * rep;
-              break;
-          }
-          builder.append (n1.getName());
-          updateNodeRefs (todoNodes, n1, minRefs);
-          break;
-        case 2:
-          n2 = nodes.get(r.nextInt(nodes.size()));
-          assert (n2.getType() instanceof BVType);
-          n2BW = ((BVType) n2.getType()).width;
+			case 1:
+				builder.append (kind.getString());
+				switch (kind) {
+				case BVNOT:
+				case BVNEG:
+					builder.append (" ");
+					resBW = n1BW;
+					break;
+				case EXTRACT:
+					upper = r.nextInt(n1BW);
+					lower = r.nextInt (upper + 1);
+					builder.append (" ");
+					builder.append (upper);
+					builder.append (" ");
+					builder.append (lower);
+					builder.append (") ");
+					resBW = upper - lower + 1;
+					break;
+				case ROTATE_LEFT:
+				case ROTATE_RIGHT:
+					rotate = r.nextInt(n1BW);
+					builder.append (" ");
+					builder.append (rotate);
+					builder.append (") ");
+					resBW = n1BW;
+					break;
+				case ZERO_EXTEND:
+				case SIGN_EXTEND:
+					ext = r.nextInt(maxBW - n1BW + 1);
+					builder.append (" ");
+					builder.append (ext);
+					builder.append (") ");
+					resBW = n1BW + ext;
+					break;
+				default:
+					assert (kind == SMTNodeKind.REPEAT);
+					maxRep = maxBW / n1BW;
+					rep = r.nextInt(maxRep) + 1;
+					builder.append (" ");
+					builder.append (rep);
+					builder.append (") ");
+					resBW = n1BW * rep;
+					break;
+				}
+				builder.append (n1.getName());
+				updateNodeRefs (todoNodes, n1, minRefs);
+				break;
+			case 2:
+				n2 = nodes.get(r.nextInt(nodes.size()));
+				assert (n2.getType() instanceof BVType);
+				n2BW = ((BVType) n2.getType()).width;
 
-          /* choose another binary operator if concat
-           * exceeds maximum bit-width */
-          if (kind == SMTNodeKind.CONCAT && n1BW + n2BW > maxBW) {
-            do {
-              kind = kinds[r.nextInt (kinds.length)];
-            } while (kind.arity != 2 || kind == SMTNodeKind.CONCAT);
-          }
+				/* choose another binary operator if concat
+				 * exceeds maximum bit-width */
+				if (kind == SMTNodeKind.CONCAT && n1BW + n2BW > maxBW) {
+					do {
+						kind = kinds[r.nextInt (kinds.length)];
+					} while (kind.arity != 2 || kind == SMTNodeKind.CONCAT);
+				}
 
-          switch (kind) {
-            case BVULT:
-            case BVULE:
-            case BVUGT:
-            case BVUGE:
-            case BVSLT:
-            case BVSLE:
-            case BVSGT:
-            case BVSGE:
-            case EQ:
-              /* encode boolean results into bit-vector */
-              builder.append ("ite (");
-              builder.append (kind.getString());
-              builder.append (" ");
-              builder.append (wrapEqualBW (r, n1, n2));
-              builder.append (") (_ bv1 1) (_ bv0 1)");
-              resBW = 1;
-              break;
-            case CONCAT:
-              builder.append (kind.getString());
-              builder.append (" ");
-              builder.append (n1.getName());
-              builder.append (" ");
-              builder.append (n2.getName());
-              resBW = n1BW + n2BW;
-              break;
-            case BVUDIV:
-            case BVSDIV:
-            case BVUREM:
-            case BVSREM:
-            case BVSMOD:
-              if (divMode == BVDivMode.GUARD) {
-                /* assumption 
-                 * wrapEqualBW tries to extend the first node before
-                 * it tries to extend the second node
-                 */
+				switch (kind) {
+				case BVULT:
+				case BVULE:
+				case BVUGT:
+				case BVUGE:
+				case BVSLT:
+				case BVSLE:
+				case BVSGT:
+				case BVSGE:
+				case EQ:
+					/* encode boolean results into bit-vector */
+					builder.append ("ite (");
+					builder.append (kind.getString());
+					builder.append (" ");
+					builder.append (wrapEqualBW (r, n1, n2));
+					builder.append (") (_ bv1 1) (_ bv0 1)");
+					resBW = 1;
+					break;
+				case CONCAT:
+					builder.append (kind.getString());
+					builder.append (" ");
+					builder.append (n1.getName());
+					builder.append (" ");
+					builder.append (n2.getName());
+					resBW = n1BW + n2BW;
+					break;
+				case BVUDIV:
+				case BVSDIV:
+				case BVUREM:
+				case BVSREM:
+				case BVSMOD:
+					if (divMode == BVDivMode.GUARD) {
+						/* assumption 
+						 * wrapEqualBW tries to extend the first node before
+						 * it tries to extend the second node
+						 */
 
-               /* we swap the nodes if the seond node would be extended  */
-                if (n1BW > n2BW) {
-                  tmp = n1BW;
-                  n1BW = n2BW;
-                  n2BW = tmp;
-                  tmpNode = n1;
-                  n1 = n2;
-                  n2 = tmpNode;
-                }
-                /* update guards if necessary */
-                if (!guards.containsKey(n2) || 
-                    guards.get(n2) == SMTNodeKind.BVUDIV ||
-                    guards.get(n2) == SMTNodeKind.BVUREM)
-                  guards.put(n2, kind);
-                /* fall through by intention */
-              }
-            default:
-              builder.append (kind.getString());
-              builder.append (" ");
-              builder.append (wrapEqualBW (r, n1, n2));
-              if (kind == SMTNodeKind.BVCOMP) {
-                resBW = 1;
-              } else  {
-                if (n1BW < n2BW)
-                  resBW = n2BW;
-                else
-                  resBW = n1BW;
-              }
-              break;
-          }
-          updateNodeRefs (todoNodes, n1, minRefs);
-          updateNodeRefs (todoNodes, n2, minRefs);
-          break;
-        case 3:
-          assert (kind == SMTNodeKind.ITE);
-          n2 = nodes.get(r.nextInt(nodes.size()));
-          assert (n2.getType() instanceof BVType);
-          n2BW = ((BVType) n2.getType()).width;
-          n3 = nodes.get(r.nextInt(nodes.size()));
-          assert (n3.getType() instanceof BVType);
-          n3BW = ((BVType) n3.getType()).width;
-          pos = r.nextInt(n1BW);
-          builder.append (kind.getString());
-          /* ite condition: is bit at random bit position set to 1? */
-          builder.append (" (= (_ bv1 1) ((_ extract ");
-          builder.append (pos);
-          builder.append (" ");
-          builder.append (pos);
-          builder.append (") ");
-          builder.append (n1.getName());
-          builder.append (")) ");
-          builder.append (wrapEqualBW(r, n2, n3));
-          if (n2BW < n3BW)
-            resBW = n3BW;
-          else  
-            resBW = n2BW;
-          updateNodeRefs (todoNodes, n1, minRefs);
-          updateNodeRefs (todoNodes, n2, minRefs);
-          updateNodeRefs (todoNodes, n3, minRefs);
-          break;
-        default:
-          assert (kind.arity == -1);
-          switch (kind){
-            case UFUNC:
-              if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
-                todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
-                uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
-              } else {
-                uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
-              }
-              updateFuncRefs (todoUFuncs, uFunc, minRefs);
-              builder.append (uFunc.getName());
-              sig = uFunc.getSignature();
-              operandTypes = sig.getOperandTypes();
-              sizeOpTypes = operandTypes.size();
-              assert (sizeOpTypes > 0);
-              curType = (BVType) operandTypes.get(0);
-              builder.append (" ");
-              builder.append (adaptBW (r, n1, curType.getWidth()));
-              updateNodeRefs (todoNodes, n1, minRefs);
-              for (int i = 1; i < sizeOpTypes; i++) {
-                n2 = nodes.get(r.nextInt(nodes.size()));
-                assert (n2.getType() instanceof BVType);
-                assert (operandTypes.get(i) instanceof BVType);
-                curType = (BVType) operandTypes.get(i);
-                builder.append (" ");
-                builder.append (adaptBW (r, n2, curType.getWidth()));
-                updateNodeRefs (todoNodes, n2, minRefs);
-              }
-              assert (sig.getResultType() instanceof BVType);
-              curType = (BVType) sig.getResultType();
-              resBW = curType.getWidth();
-              break;
-            case UPRED:
-              if (!todoUPreds.isEmpty() && r.nextBoolean()) {
-                todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
-                uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
-              } else {
-                uPred = uPreds.get(r.nextInt(sizeUPreds));
-              }
-              updatePredRefs (todoUPreds, uPred, minRefs);
-              builder.append ("ite (");
-              builder.append (uPred.getName());
-              sig = uPred.getSignature();
-              operandTypes = sig.getOperandTypes();
-              sizeOpTypes = operandTypes.size();
-              assert (sizeOpTypes > 0);
-              curType = (BVType) operandTypes.get(0);
-              builder.append (" ");
-              builder.append (adaptBW (r, n1, curType.getWidth()));
-              updateNodeRefs (todoNodes, n1, minRefs);
-              for (int i = 1; i < sizeOpTypes; i++) {
-                n2 = nodes.get(r.nextInt(nodes.size()));
-                assert (n2.getType() instanceof BVType);
-                assert (operandTypes.get(i) instanceof BVType);
-                curType = (BVType) operandTypes.get(i);
-                builder.append (" ");
-                builder.append (adaptBW (r, n2, curType.getWidth()));
-                updateNodeRefs (todoNodes, n2, minRefs);
-              }
-              builder.append (") (_ bv1 1) (_ bv0 1)");
-              assert (sig.getResultType() == BoolType.boolType);
-              resBW = 1;
-              break;
-            default:
-              assert (kind == SMTNodeKind.DISTINCT);
-              n2 = nodes.get(r.nextInt(nodes.size()));
-              assert (n2.getType() instanceof BVType);
-              n2BW = ((BVType) n2.getType()).width;
-              builder.append ("ite (");
-              builder.append (kind.getString());
-              builder.append (" ");
-              builder.append (wrapEqualBW (r, n1, n2));
-              builder.append (") (_ bv1 1) (_ bv0 1)");
-              resBW = 1;
-              updateNodeRefs (todoNodes, n1, minRefs);
-              updateNodeRefs (todoNodes, n2, minRefs);
-              break;
-          }
-          break;
+						/* we swap the nodes if the seond node would be extended  */
+						if (n1BW > n2BW) {
+							tmp = n1BW;
+							n1BW = n2BW;
+							n2BW = tmp;
+							tmpNode = n1;
+							n1 = n2;
+							n2 = tmpNode;
+						}
+						/* update guards if necessary */
+						if (!guards.containsKey(n2) || 
+								guards.get(n2) == SMTNodeKind.BVUDIV ||
+								guards.get(n2) == SMTNodeKind.BVUREM)
+							guards.put(n2, kind);
+						/* fall through by intention */
+					}
+				default:
+					builder.append (kind.getString());
+					builder.append (" ");
+					builder.append (wrapEqualBW (r, n1, n2));
+					if (kind == SMTNodeKind.BVCOMP) {
+						resBW = 1;
+					} else  {
+						if (n1BW < n2BW)
+							resBW = n2BW;
+						else
+							resBW = n1BW;
+					}
+					break;
+				}
+				updateNodeRefs (todoNodes, n1, minRefs);
+				updateNodeRefs (todoNodes, n2, minRefs);
+				break;
+			case 3:
+				assert (kind == SMTNodeKind.ITE);
+				n2 = nodes.get(r.nextInt(nodes.size()));
+				assert (n2.getType() instanceof BVType);
+				n2BW = ((BVType) n2.getType()).width;
+				n3 = nodes.get(r.nextInt(nodes.size()));
+				assert (n3.getType() instanceof BVType);
+				n3BW = ((BVType) n3.getType()).width;
+				pos = r.nextInt(n1BW);
+				builder.append (kind.getString());
+				/* ite condition: is bit at random bit position set to 1? */
+				builder.append (" (= (_ bv1 1) ((_ extract ");
+				builder.append (pos);
+				builder.append (" ");
+				builder.append (pos);
+				builder.append (") ");
+				builder.append (n1.getName());
+				builder.append (")) ");
+				builder.append (wrapEqualBW(r, n2, n3));
+				if (n2BW < n3BW)
+					resBW = n3BW;
+				else  
+					resBW = n2BW;
+				updateNodeRefs (todoNodes, n1, minRefs);
+				updateNodeRefs (todoNodes, n2, minRefs);
+				updateNodeRefs (todoNodes, n3, minRefs);
+				break;
+			default:
+				assert (kind.arity == -1);
+				switch (kind){
+				case UFUNC:
+					if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
+						todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
+						uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
+					} else {
+						uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
+					}
+					updateFuncRefs (todoUFuncs, uFunc, minRefs);
+					builder.append (uFunc.getName());
+					sig = uFunc.getSignature();
+					operandTypes = sig.getOperandTypes();
+					sizeOpTypes = operandTypes.size();
+					assert (sizeOpTypes > 0);
+					curType = (BVType) operandTypes.get(0);
+					builder.append (" ");
+					builder.append (adaptBW (r, n1, curType.getWidth()));
+					updateNodeRefs (todoNodes, n1, minRefs);
+					for (int i = 1; i < sizeOpTypes; i++) {
+						n2 = nodes.get(r.nextInt(nodes.size()));
+						assert (n2.getType() instanceof BVType);
+						assert (operandTypes.get(i) instanceof BVType);
+						curType = (BVType) operandTypes.get(i);
+						builder.append (" ");
+						builder.append (adaptBW (r, n2, curType.getWidth()));
+						updateNodeRefs (todoNodes, n2, minRefs);
+					}
+					assert (sig.getResultType() instanceof BVType);
+					curType = (BVType) sig.getResultType();
+					resBW = curType.getWidth();
+					break;
+				case UPRED:
+					if (!todoUPreds.isEmpty() && r.nextBoolean()) {
+						todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
+						uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
+					} else {
+						uPred = uPreds.get(r.nextInt(sizeUPreds));
+					}
+					updatePredRefs (todoUPreds, uPred, minRefs);
+					builder.append ("ite (");
+					builder.append (uPred.getName());
+					sig = uPred.getSignature();
+					operandTypes = sig.getOperandTypes();
+					sizeOpTypes = operandTypes.size();
+					assert (sizeOpTypes > 0);
+					curType = (BVType) operandTypes.get(0);
+					builder.append (" ");
+					builder.append (adaptBW (r, n1, curType.getWidth()));
+					updateNodeRefs (todoNodes, n1, minRefs);
+					for (int i = 1; i < sizeOpTypes; i++) {
+						n2 = nodes.get(r.nextInt(nodes.size()));
+						assert (n2.getType() instanceof BVType);
+						assert (operandTypes.get(i) instanceof BVType);
+						curType = (BVType) operandTypes.get(i);
+						builder.append (" ");
+						builder.append (adaptBW (r, n2, curType.getWidth()));
+						updateNodeRefs (todoNodes, n2, minRefs);
+					}
+					builder.append (") (_ bv1 1) (_ bv0 1)");
+					assert (sig.getResultType() == BoolType.boolType);
+					resBW = 1;
+					break;
+				default:
+					assert (kind == SMTNodeKind.DISTINCT);
+					n2 = nodes.get(r.nextInt(nodes.size()));
+					assert (n2.getType() instanceof BVType);
+					n2BW = ((BVType) n2.getType()).width;
+					builder.append ("ite (");
+					builder.append (kind.getString());
+					builder.append (" ");
+					builder.append (wrapEqualBW (r, n1, n2));
+					builder.append (") (_ bv1 1) (_ bv0 1)");
+					resBW = 1;
+					updateNodeRefs (todoNodes, n1, minRefs);
+					updateNodeRefs (todoNodes, n2, minRefs);
+					break;
+				}
+				break;
       }
 
       builder.append (")))\n");
@@ -1324,8 +2077,8 @@ public class FuzzSMT {
 
     if(!uFuncs.isEmpty())
       kindSet.add(SMTNodeKind.UFUNC);
-   if(!uPreds.isEmpty())
-     kindSet.add(SMTNodeKind.UPRED);
+		if(!uPreds.isEmpty())
+			kindSet.add(SMTNodeKind.UPRED);
     kinds = kindSet.toArray(new SMTNodeKind[0]);
     todoSetNodes = new HashMap<SMTNode, Integer>();
     for(int i = 0; i < setNodes.size(); i++)
@@ -1340,7 +2093,7 @@ public class FuzzSMT {
     todoUPreds = new HashMap<UPred, Integer>();
     sizeUPreds = uPreds.size();
     for (int i = 0; i < sizeUPreds; i++)
-        todoUPreds.put (uPreds.get(i), new Integer(0));
+			todoUPreds.put (uPreds.get(i), new Integer(0));
 
     builder = new StringBuilder();
     oldSize = setNodes.size();
@@ -1361,77 +2114,77 @@ public class FuzzSMT {
       }
       assert (n1.getType() == SetType.setType);
       switch (kind) {
-        case INTERSECTION:
-        case SETMINUS:
-        case UNION:
-          builder.append (kind.getString());
-          builder.append (" ");
-          n2 = setNodes.get(r.nextInt(setNodes.size()));
-          assert (n2.getType() == SetType.setType);
-          builder.append (n1.getName());
-          builder.append (" ");
-          builder.append (n2.getName());
-          updateNodeRefs (todoSetNodes, n1, minRefs);
-          updateNodeRefs (todoSetNodes, n2, minRefs);
-          break;
-        case UFUNC:
-          if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
-            todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
-            uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
-          } else {
-            uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
-          }
-          updateFuncRefs (todoUFuncs, uFunc, minRefs);
-          builder.append (uFunc.getName());
-          sig = uFunc.getSignature();
-          operandTypes = sig.getOperandTypes();
-          sizeOpTypes = operandTypes.size();
-          assert (sizeOpTypes > 0);
-          assert (operandTypes.get(0) == SetType.setType);
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoSetNodes, n1, minRefs);
-          for (int i = 1; i < sizeOpTypes; i++) {
-            n2 = setNodes.get(r.nextInt(setNodes.size()));
-            assert (n2.getType() == SetType.setType);
-            assert (operandTypes.get(i) == SetType.setType);
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoSetNodes, n2, minRefs);
-          }
-          assert (sig.getResultType() == SetType.setType);
-          break;
-        case UPRED:
-          if (!todoUPreds.isEmpty() && r.nextBoolean()) {
-            todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
-            uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
-          } else {
-            uPred = uPreds.get(r.nextInt(sizeUPreds));
-          }
-          updatePredRefs (todoUPreds, uPred, minRefs);
-          builder.append ("ite (");
-          builder.append (uPred.getName());
-          sig = uPred.getSignature();
-          operandTypes = sig.getOperandTypes();
-          sizeOpTypes = operandTypes.size();
-          assert (sizeOpTypes > 0);
-          assert (operandTypes.get(0) == SetType.setType);
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoSetNodes, n1, minRefs);
-          for (int i = 1; i < sizeOpTypes; i++) {
-            n2 = setNodes.get(r.nextInt(setNodes.size()));
-            assert (n2.getType() == SetType.setType);
-            assert (operandTypes.get(i) == SetType.setType);
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoSetNodes, n2, minRefs);
-          }
-          builder.append (") (setenum 1) (setenum 0)");
-          assert (sig.getResultType() == BoolType.boolType);
-          break;
-        default:
-          break;
+			case INTERSECTION:
+			case SETMINUS:
+			case UNION:
+				builder.append (kind.getString());
+				builder.append (" ");
+				n2 = setNodes.get(r.nextInt(setNodes.size()));
+				assert (n2.getType() == SetType.setType);
+				builder.append (n1.getName());
+				builder.append (" ");
+				builder.append (n2.getName());
+				updateNodeRefs (todoSetNodes, n1, minRefs);
+				updateNodeRefs (todoSetNodes, n2, minRefs);
+				break;
+			case UFUNC:
+				if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
+					todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
+					uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
+				} else {
+					uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
+				}
+				updateFuncRefs (todoUFuncs, uFunc, minRefs);
+				builder.append (uFunc.getName());
+				sig = uFunc.getSignature();
+				operandTypes = sig.getOperandTypes();
+				sizeOpTypes = operandTypes.size();
+				assert (sizeOpTypes > 0);
+				assert (operandTypes.get(0) == SetType.setType);
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoSetNodes, n1, minRefs);
+				for (int i = 1; i < sizeOpTypes; i++) {
+					n2 = setNodes.get(r.nextInt(setNodes.size()));
+					assert (n2.getType() == SetType.setType);
+					assert (operandTypes.get(i) == SetType.setType);
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoSetNodes, n2, minRefs);
+				}
+				assert (sig.getResultType() == SetType.setType);
+				break;
+			case UPRED:
+				if (!todoUPreds.isEmpty() && r.nextBoolean()) {
+					todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
+					uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
+				} else {
+					uPred = uPreds.get(r.nextInt(sizeUPreds));
+				}
+				updatePredRefs (todoUPreds, uPred, minRefs);
+				builder.append ("ite (");
+				builder.append (uPred.getName());
+				sig = uPred.getSignature();
+				operandTypes = sig.getOperandTypes();
+				sizeOpTypes = operandTypes.size();
+				assert (sizeOpTypes > 0);
+				assert (operandTypes.get(0) == SetType.setType);
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoSetNodes, n1, minRefs);
+				for (int i = 1; i < sizeOpTypes; i++) {
+					n2 = setNodes.get(r.nextInt(setNodes.size()));
+					assert (n2.getType() == SetType.setType);
+					assert (operandTypes.get(i) == SetType.setType);
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoSetNodes, n2, minRefs);
+				}
+				builder.append (") (setenum 1) (setenum 0)");
+				assert (sig.getResultType() == BoolType.boolType);
+				break;
+			default:
+				break;
       }
       builder.append (")))\n");
 
@@ -1549,121 +2302,121 @@ public class FuzzSMT {
       }
       assert (n1.getType() == IntType.intType);
       switch (kind) {
-        case PLUS:
-        case BINMINUS:
-          builder.append (kind.getString());
-          builder.append (" ");
-          n2 = intNodes.get(r.nextInt(intNodes.size()));
-          assert (n2.getType() == IntType.intType);
-          builder.append (n1.getName());
-          builder.append (" ");
-          builder.append (n2.getName());
-          updateNodeRefs (todoIntNodes, n1, minRefs);
-          updateNodeRefs (todoIntNodes, n2, minRefs);
-          break;
-        case MUL:
-          builder.append (kind.getString());
-          builder.append (" ");
-          if (linear || r.nextBoolean()) {
-            n2 = intConsts.get(r.nextInt(sizeIntConsts));
-            assert (n2.getType() == IntType.intType);
-            switch (r.nextInt(4)) {
-              case 0:
-                builder.append (n1.getName());
-                builder.append (" ");
-                builder.append (n2.getName());
-                break;
-              case 1:
-                builder.append (n2.getName());
-                builder.append (" ");
-                builder.append (n1.getName());
-                break;
-              case 2:
-                builder.append (n1.getName());
-                builder.append (" (- ");
-                builder.append (n2.getName());
-                builder.append (")");
-                break;
-              case 3:
-                builder.append ("(- ");
-                builder.append (n2.getName());
-                builder.append (") ");
-                builder.append (n1.getName());
-                break;
-            }
-            updateNodeRefs (todoIntConsts, n2, minRefs);
-          } else {
-            n2 = intNodes.get(r.nextInt(intNodes.size()));
-            assert (n2.getType() == IntType.intType);
-            builder.append (n1.getName());
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoIntNodes, n2, minRefs);
-          }
-          updateNodeRefs (todoIntNodes, n1, minRefs);
-          break;
-        case UNMINUS:
-          builder.append (kind.getString());
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoIntNodes, n1, minRefs);
-          break;
-        case UFUNC:
-          if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
-            todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
-            uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
-          } else {
-            uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
-          }
-          updateFuncRefs (todoUFuncs, uFunc, minRefs);
-          builder.append (uFunc.getName());
-          sig = uFunc.getSignature();
-          operandTypes = sig.getOperandTypes();
-          sizeOpTypes = operandTypes.size();
-          assert (sizeOpTypes > 0);
-          assert (operandTypes.get(0) == IntType.intType);
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoIntNodes, n1, minRefs);
-          for (int i = 1; i < sizeOpTypes; i++) {
-            n2 = intNodes.get(r.nextInt(intNodes.size()));
-            assert (n2.getType() == IntType.intType);
-            assert (operandTypes.get(i) == IntType.intType);
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoIntNodes, n2, minRefs);
-          }
-          assert (sig.getResultType() == IntType.intType);
-          break;
-        case UPRED:
-          if (!todoUPreds.isEmpty() && r.nextBoolean()) {
-            todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
-            uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
-          } else {
-            uPred = uPreds.get(r.nextInt(sizeUPreds));
-          }
-          updatePredRefs (todoUPreds, uPred, minRefs);
-          builder.append ("ite (");
-          builder.append (uPred.getName());
-          sig = uPred.getSignature();
-          operandTypes = sig.getOperandTypes();
-          sizeOpTypes = operandTypes.size();
-          assert (sizeOpTypes > 0);
-          assert (operandTypes.get(0) == IntType.intType);
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoIntNodes, n1, minRefs);
-          for (int i = 1; i < sizeOpTypes; i++) {
-            n2 = intNodes.get(r.nextInt(intNodes.size()));
-            assert (n2.getType() == IntType.intType);
-            assert (operandTypes.get(i) == IntType.intType);
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoIntNodes, n2, minRefs);
-          }
-          builder.append (") 1 0");
-          assert (sig.getResultType() == BoolType.boolType);
-          break;
+			case PLUS:
+			case BINMINUS:
+				builder.append (kind.getString());
+				builder.append (" ");
+				n2 = intNodes.get(r.nextInt(intNodes.size()));
+				assert (n2.getType() == IntType.intType);
+				builder.append (n1.getName());
+				builder.append (" ");
+				builder.append (n2.getName());
+				updateNodeRefs (todoIntNodes, n1, minRefs);
+				updateNodeRefs (todoIntNodes, n2, minRefs);
+				break;
+			case MUL:
+				builder.append (kind.getString());
+				builder.append (" ");
+				if (linear || r.nextBoolean()) {
+					n2 = intConsts.get(r.nextInt(sizeIntConsts));
+					assert (n2.getType() == IntType.intType);
+					switch (r.nextInt(4)) {
+					case 0:
+						builder.append (n1.getName());
+						builder.append (" ");
+						builder.append (n2.getName());
+						break;
+					case 1:
+						builder.append (n2.getName());
+						builder.append (" ");
+						builder.append (n1.getName());
+						break;
+					case 2:
+						builder.append (n1.getName());
+						builder.append (" (- ");
+						builder.append (n2.getName());
+						builder.append (")");
+						break;
+					case 3:
+						builder.append ("(- ");
+						builder.append (n2.getName());
+						builder.append (") ");
+						builder.append (n1.getName());
+						break;
+					}
+					updateNodeRefs (todoIntConsts, n2, minRefs);
+				} else {
+					n2 = intNodes.get(r.nextInt(intNodes.size()));
+					assert (n2.getType() == IntType.intType);
+					builder.append (n1.getName());
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoIntNodes, n2, minRefs);
+				}
+				updateNodeRefs (todoIntNodes, n1, minRefs);
+				break;
+			case UNMINUS:
+				builder.append (kind.getString());
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoIntNodes, n1, minRefs);
+				break;
+			case UFUNC:
+				if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
+					todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
+					uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
+				} else {
+					uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
+				}
+				updateFuncRefs (todoUFuncs, uFunc, minRefs);
+				builder.append (uFunc.getName());
+				sig = uFunc.getSignature();
+				operandTypes = sig.getOperandTypes();
+				sizeOpTypes = operandTypes.size();
+				assert (sizeOpTypes > 0);
+				assert (operandTypes.get(0) == IntType.intType);
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoIntNodes, n1, minRefs);
+				for (int i = 1; i < sizeOpTypes; i++) {
+					n2 = intNodes.get(r.nextInt(intNodes.size()));
+					assert (n2.getType() == IntType.intType);
+					assert (operandTypes.get(i) == IntType.intType);
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoIntNodes, n2, minRefs);
+				}
+				assert (sig.getResultType() == IntType.intType);
+				break;
+			case UPRED:
+				if (!todoUPreds.isEmpty() && r.nextBoolean()) {
+					todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
+					uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
+				} else {
+					uPred = uPreds.get(r.nextInt(sizeUPreds));
+				}
+				updatePredRefs (todoUPreds, uPred, minRefs);
+				builder.append ("ite (");
+				builder.append (uPred.getName());
+				sig = uPred.getSignature();
+				operandTypes = sig.getOperandTypes();
+				sizeOpTypes = operandTypes.size();
+				assert (sizeOpTypes > 0);
+				assert (operandTypes.get(0) == IntType.intType);
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoIntNodes, n1, minRefs);
+				for (int i = 1; i < sizeOpTypes; i++) {
+					n2 = intNodes.get(r.nextInt(intNodes.size()));
+					assert (n2.getType() == IntType.intType);
+					assert (operandTypes.get(i) == IntType.intType);
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoIntNodes, n2, minRefs);
+				}
+				builder.append (") 1 0");
+				assert (sig.getResultType() == BoolType.boolType);
+				break;
       }
       builder.append (")))\n");
 
@@ -1755,149 +2508,149 @@ public class FuzzSMT {
         }
       }
       switch (kind) {
-        case PLUS:
-        case BINMINUS:
-          builder.append (kind.getString());
-          builder.append (" ");
-          n2 = realNodes.get(r.nextInt(realNodes.size()));
-          assert (n2.getType() == RealType.realType);
-          builder.append (n1.getName());
-          builder.append (" ");
-          builder.append (n2.getName());
-          updateNodeRefs (todoRealNodes, n1, minRefs);
-          updateNodeRefs (todoRealNodes, n2, minRefs);
-          break;
-        case MUL:
-          builder.append (kind.getString());
-          builder.append (" ");
-          if (linear || r.nextBoolean()) {
-            n2 = intConstsAsReal.get(r.nextInt(sizeIntConsts));
-            assert (n2.getType() == RealType.realType);
-            switch (r.nextInt(4)) {
-              case 0:
-                builder.append (n1.getName());
-                builder.append (" ");
-                builder.append (n2.getName());
-                break;
-              case 1:
-                builder.append (n2.getName());
-                builder.append (" ");
-                builder.append (n1.getName());
-                break;
-              case 2:
-                builder.append (n1.getName());
-                builder.append (" (- ");
-                builder.append (n2.getName());
-                builder.append (")");
-                break;
-              case 3:
-                builder.append ("(- ");
-                builder.append (n2.getName());
-                builder.append (") ");
-                builder.append (n1.getName());
-                break;
-            }
-            updateNodeRefs (todoIntConsts, n2, minRefs);
-          } else {
-            n2 = realNodes.get(r.nextInt(realNodes.size()));
-            assert (n2.getType() == RealType.realType);
-            builder.append (n1.getName());
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoRealNodes, n2, minRefs);
-          }
-          updateNodeRefs (todoRealNodes, n1, minRefs);
-          break;
-        case UNMINUS:
-          builder.append (kind.getString());
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoRealNodes, n1, minRefs);
-          break;
-        case DIV:
-          builder.append (kind.getString());
-          builder.append (" ");
-          if (noBlowup && r.nextBoolean() && !todoIntConsts.isEmpty()){
-            todoArray = todoIntConsts.keySet().toArray (new SMTNode[0]);
-            c1 = todoArray[r.nextInt(todoArray.length)];
-          } else {
-            c1 = intConstsAsReal.get(r.nextInt(sizeIntConsts));
-          }
-          do {
-            c2 = intConstsAsReal.get(r.nextInt(sizeIntConsts));
-          } while (zeroConsts.contains(c2));
-          builder.append (c1.getName());
-          builder.append (" ");
-          if (r.nextBoolean()) {
-            builder.append (c2.getName());
-          } else {
-            builder.append ("(- ");
-            builder.append (c2.getName());
-            builder.append (")");
-          }
-          updateNodeRefs (todoIntConsts, c1, minRefs);
-          updateNodeRefs (todoIntConsts, c2, minRefs);
-          break;
-       case UFUNC:
-          if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
-            todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
-            uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
-          } else {
-            uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
-          }
-          updateFuncRefs (todoUFuncs, uFunc, minRefs);
-          builder.append (uFunc.getName());
-          sig = uFunc.getSignature();
-          operandTypes = sig.getOperandTypes();
-          sizeOpTypes = operandTypes.size();
-          assert (sizeOpTypes > 0);
-          assert (operandTypes.get(0) == RealType.realType);
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoRealNodes, n1, minRefs);
-          for (int i = 1; i < sizeOpTypes; i++) {
-            n2 = realNodes.get(r.nextInt(realNodes.size()));
-            assert (n2.getType() == RealType.realType);
-            assert (operandTypes.get(i) == RealType.realType);
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoRealNodes, n2, minRefs);
-          }
-          assert (sig.getResultType() == RealType.realType);
-          break;
-        case UPRED:
-          if (!todoUPreds.isEmpty() && r.nextBoolean()) {
-            todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
-            uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
-          } else {
-            uPred = uPreds.get(r.nextInt(sizeUPreds));
-          }
-          updatePredRefs (todoUPreds, uPred, minRefs);
-          builder.append ("ite (");
-          builder.append (uPred.getName());
-          sig = uPred.getSignature();
-          operandTypes = sig.getOperandTypes();
-          sizeOpTypes = operandTypes.size();
-          assert (sizeOpTypes > 0);
-          assert (operandTypes.get(0) == RealType.realType);
-          builder.append (" ");
-          builder.append (n1.getName());
-          updateNodeRefs (todoRealNodes, n1, minRefs);
-          for (int i = 1; i < sizeOpTypes; i++) {
-            n2 = realNodes.get(r.nextInt(realNodes.size()));
-            assert (n2.getType() == RealType.realType);
-            assert (operandTypes.get(i) == RealType.realType);
-            builder.append (" ");
-            builder.append (n2.getName());
-            updateNodeRefs (todoRealNodes, n2, minRefs);
-          }
-          builder.append (") ");
-          if (printConstsAsReal) 
-            builder.append ("1.0 0.0");
-          else
-            builder.append ("1 0");
-          assert (sig.getResultType() == BoolType.boolType);
-          break;
+			case PLUS:
+			case BINMINUS:
+				builder.append (kind.getString());
+				builder.append (" ");
+				n2 = realNodes.get(r.nextInt(realNodes.size()));
+				assert (n2.getType() == RealType.realType);
+				builder.append (n1.getName());
+				builder.append (" ");
+				builder.append (n2.getName());
+				updateNodeRefs (todoRealNodes, n1, minRefs);
+				updateNodeRefs (todoRealNodes, n2, minRefs);
+				break;
+			case MUL:
+				builder.append (kind.getString());
+				builder.append (" ");
+				if (linear || r.nextBoolean()) {
+					n2 = intConstsAsReal.get(r.nextInt(sizeIntConsts));
+					assert (n2.getType() == RealType.realType);
+					switch (r.nextInt(4)) {
+					case 0:
+						builder.append (n1.getName());
+						builder.append (" ");
+						builder.append (n2.getName());
+						break;
+					case 1:
+						builder.append (n2.getName());
+						builder.append (" ");
+						builder.append (n1.getName());
+						break;
+					case 2:
+						builder.append (n1.getName());
+						builder.append (" (- ");
+						builder.append (n2.getName());
+						builder.append (")");
+						break;
+					case 3:
+						builder.append ("(- ");
+						builder.append (n2.getName());
+						builder.append (") ");
+						builder.append (n1.getName());
+						break;
+					}
+					updateNodeRefs (todoIntConsts, n2, minRefs);
+				} else {
+					n2 = realNodes.get(r.nextInt(realNodes.size()));
+					assert (n2.getType() == RealType.realType);
+					builder.append (n1.getName());
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoRealNodes, n2, minRefs);
+				}
+				updateNodeRefs (todoRealNodes, n1, minRefs);
+				break;
+			case UNMINUS:
+				builder.append (kind.getString());
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoRealNodes, n1, minRefs);
+				break;
+			case DIV:
+				builder.append (kind.getString());
+				builder.append (" ");
+				if (noBlowup && r.nextBoolean() && !todoIntConsts.isEmpty()){
+					todoArray = todoIntConsts.keySet().toArray (new SMTNode[0]);
+					c1 = todoArray[r.nextInt(todoArray.length)];
+				} else {
+					c1 = intConstsAsReal.get(r.nextInt(sizeIntConsts));
+				}
+				do {
+					c2 = intConstsAsReal.get(r.nextInt(sizeIntConsts));
+				} while (zeroConsts.contains(c2));
+				builder.append (c1.getName());
+				builder.append (" ");
+				if (r.nextBoolean()) {
+					builder.append (c2.getName());
+				} else {
+					builder.append ("(- ");
+					builder.append (c2.getName());
+					builder.append (")");
+				}
+				updateNodeRefs (todoIntConsts, c1, minRefs);
+				updateNodeRefs (todoIntConsts, c2, minRefs);
+				break;
+			case UFUNC:
+				if (!todoUFuncs.isEmpty() && r.nextBoolean()) {
+					todoUFuncsArray = todoUFuncs.keySet().toArray (new UFunc[0]);
+					uFunc = todoUFuncsArray[r.nextInt(todoUFuncsArray.length)];
+				} else {
+					uFunc = uFuncs.get(r.nextInt(sizeUFuncs));
+				}
+				updateFuncRefs (todoUFuncs, uFunc, minRefs);
+				builder.append (uFunc.getName());
+				sig = uFunc.getSignature();
+				operandTypes = sig.getOperandTypes();
+				sizeOpTypes = operandTypes.size();
+				assert (sizeOpTypes > 0);
+				assert (operandTypes.get(0) == RealType.realType);
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoRealNodes, n1, minRefs);
+				for (int i = 1; i < sizeOpTypes; i++) {
+					n2 = realNodes.get(r.nextInt(realNodes.size()));
+					assert (n2.getType() == RealType.realType);
+					assert (operandTypes.get(i) == RealType.realType);
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoRealNodes, n2, minRefs);
+				}
+				assert (sig.getResultType() == RealType.realType);
+				break;
+			case UPRED:
+				if (!todoUPreds.isEmpty() && r.nextBoolean()) {
+					todoUPredsArray = todoUPreds.keySet().toArray (new UPred[0]);
+					uPred = todoUPredsArray[r.nextInt(todoUPredsArray.length)];
+				} else {
+					uPred = uPreds.get(r.nextInt(sizeUPreds));
+				}
+				updatePredRefs (todoUPreds, uPred, minRefs);
+				builder.append ("ite (");
+				builder.append (uPred.getName());
+				sig = uPred.getSignature();
+				operandTypes = sig.getOperandTypes();
+				sizeOpTypes = operandTypes.size();
+				assert (sizeOpTypes > 0);
+				assert (operandTypes.get(0) == RealType.realType);
+				builder.append (" ");
+				builder.append (n1.getName());
+				updateNodeRefs (todoRealNodes, n1, minRefs);
+				for (int i = 1; i < sizeOpTypes; i++) {
+					n2 = realNodes.get(r.nextInt(realNodes.size()));
+					assert (n2.getType() == RealType.realType);
+					assert (operandTypes.get(i) == RealType.realType);
+					builder.append (" ");
+					builder.append (n2.getName());
+					updateNodeRefs (todoRealNodes, n2, minRefs);
+				}
+				builder.append (") ");
+				if (printConstsAsReal) 
+					builder.append ("1.0 0.0");
+				else
+					builder.append ("1 0");
+				assert (sig.getResultType() == BoolType.boolType);
+				break;
       }
       builder.append (")))\n");
         
@@ -2106,9 +2859,9 @@ public class FuzzSMT {
     return generated;
   }
 
-/*----------------------------------------------------------------------------*/
-/* Predicate Layer                                                            */
-/*----------------------------------------------------------------------------*/
+	/*----------------------------------------------------------------------------*/
+	/* Predicate Layer                                                            */
+	/*----------------------------------------------------------------------------*/
 
   private static int generateBVPredicateLayer (Random r, 
                                                List<SMTNode> bvNodes,
@@ -2156,7 +2909,7 @@ public class FuzzSMT {
     oldSize = boolNodes.size();
     sizeBVNodes = bvNodes.size();
     while (!todoNodes.isEmpty() || !todoUPreds.isEmpty()){
-         name = "e" + SMTNode.getNodeCtr();
+			name = "e" + SMTNode.getNodeCtr();
       builder.append ("(let ((");
       builder.append (name);
       builder.append (" (");
@@ -2443,18 +3196,18 @@ public class FuzzSMT {
     assert (minRefs > 0);
     
     switch (compMode) {
-      case OFF:
-        assert (uPreds.size() > 0);
-        kindSet = EnumSet.noneOf (SMTNodeKind.class);
-        break;
-      case EQ:
-        kindSet = EnumSet.range (SMTNodeKind.EQ, SMTNodeKind.DISTINCT);
-        break;
-      case FULL:
-        kindSet = EnumSet.range (SMTNodeKind.LT, SMTNodeKind.DISTINCT);
-        break;
-      default:
-        assert (false);
+		case OFF:
+			assert (uPreds.size() > 0);
+			kindSet = EnumSet.noneOf (SMTNodeKind.class);
+			break;
+		case EQ:
+			kindSet = EnumSet.range (SMTNodeKind.EQ, SMTNodeKind.DISTINCT);
+			break;
+		case FULL:
+			kindSet = EnumSet.range (SMTNodeKind.LT, SMTNodeKind.DISTINCT);
+			break;
+		default:
+			assert (false);
     }
 
     todoUPreds = new HashMap<UPred, Integer>();
@@ -2614,9 +3367,9 @@ public class FuzzSMT {
     return boolNodes.size() - oldSize;
   }
 
-/*----------------------------------------------------------------------------*/
-/* Boolean Layer                                                              */
-/*----------------------------------------------------------------------------*/
+	/*----------------------------------------------------------------------------*/
+	/* Boolean Layer                                                              */
+	/*----------------------------------------------------------------------------*/
 
   private static int generateBooleanLayer (Random r, List<SMTNode> nodes){
     int generated = 0;
@@ -2653,25 +3406,25 @@ public class FuzzSMT {
       else
         kind = kindsNoIfThenElse[r.nextInt(kindsNoIfThenElse.length)];
       switch (kind) {
-        case NOT:
-          builder.append (SMTNodeKind.NOT.getString());
-          builder.append (" ");
-          builder.append (n1.getName());
-          break;
-        case IF_THEN_ELSE:
-          assert (nodes.size() >= 3);
-          n2 = nodes.get(r.nextInt(nodes.size()));
-          assert (n2.getType() == BoolType.boolType);
-          n3 = nodes.get(r.nextInt(nodes.size()));
-          assert (n3.getType() == BoolType.boolType);
-          builder.append (SMTNodeKind.IF_THEN_ELSE.getString());
-          builder.append (" ");
-          builder.append (n1.getName());
-          builder.append (" ");
-          builder.append (n2.getName());
-          builder.append (" ");
-          builder.append (n3.getName());
-          break;
+			case NOT:
+				builder.append (SMTNodeKind.NOT.getString());
+				builder.append (" ");
+				builder.append (n1.getName());
+				break;
+			case IF_THEN_ELSE:
+				assert (nodes.size() >= 3);
+				n2 = nodes.get(r.nextInt(nodes.size()));
+				assert (n2.getType() == BoolType.boolType);
+				n3 = nodes.get(r.nextInt(nodes.size()));
+				assert (n3.getType() == BoolType.boolType);
+				builder.append (SMTNodeKind.IF_THEN_ELSE.getString());
+				builder.append (" ");
+				builder.append (n1.getName());
+				builder.append (" ");
+				builder.append (n2.getName());
+				builder.append (" ");
+				builder.append (n3.getName());
+				break;
       default:
         /* binary operators */
         n2 = nodes.get(r.nextInt(nodes.size()));
@@ -2895,12 +3648,12 @@ public class FuzzSMT {
   }
 
   private static int generateQFormulasUF (Random r, SMTType type, 
-                                           List<UFunc> uFuncs, 
-                                           List<UPred> uPreds, 
-                                           int numQFormulas, int minQVars, 
-                                           int maxQVars, int minQNestings, 
-                                           int maxQNestings, boolean onlyEqComp,
-                                           int minRefs) {
+																					List<UFunc> uFuncs, 
+																					List<UPred> uPreds, 
+																					int numQFormulas, int minQVars, 
+																					int maxQVars, int minQNestings, 
+																					int maxQNestings, boolean onlyEqComp,
+																					int minRefs) {
 
     int qVarCounter = 0;
     int nodeCounter = 0;
@@ -3048,23 +3801,23 @@ public class FuzzSMT {
         else
           kind = kindsBoolNoIfThenElse[r.nextInt(kindsBoolNoIfThenElse.length)];
         switch (kind) {
-          case NOT:
-            builder.append (SMTNodeKind.NOT.getString());
-            builder.append (" ");
-            builder.append (s1);
-            break;
-          case IF_THEN_ELSE:
-            assert (boolNames.size() >= 3);
-            s2 = boolNamesArray[r.nextInt(boolNamesArray.length)];
-            s3 = boolNamesArray[r.nextInt(boolNamesArray.length)];
-            builder.append (SMTNodeKind.IF_THEN_ELSE.getString());
-            builder.append (" ");
-            builder.append (s1);
-            builder.append (" ");
-            builder.append (s2);
-            builder.append (" ");
-            builder.append (s3);
-            break;
+				case NOT:
+					builder.append (SMTNodeKind.NOT.getString());
+					builder.append (" ");
+					builder.append (s1);
+					break;
+				case IF_THEN_ELSE:
+					assert (boolNames.size() >= 3);
+					s2 = boolNamesArray[r.nextInt(boolNamesArray.length)];
+					s3 = boolNamesArray[r.nextInt(boolNamesArray.length)];
+					builder.append (SMTNodeKind.IF_THEN_ELSE.getString());
+					builder.append (" ");
+					builder.append (s1);
+					builder.append (" ");
+					builder.append (s2);
+					builder.append (" ");
+					builder.append (s3);
+					break;
         default:
           /* binary operators */
           s2 = boolNamesArray[r.nextInt(boolNamesArray.length)];
@@ -3097,9 +3850,9 @@ public class FuzzSMT {
   }
 
 
-/*----------------------------------------------------------------------------*/
-/* Main method                                                                */
-/*----------------------------------------------------------------------------*/
+	/*----------------------------------------------------------------------------*/
+	/* Main method                                                                */
+	/*----------------------------------------------------------------------------*/
 
   private enum BooleanLayerKind {
     AND,
@@ -3120,6 +3873,22 @@ public class FuzzSMT {
     assert (str != null);
     if (max < min)
       printErrAndExit ("minimum number of " + str + " must be <= maximum");
+  }
+
+  private static void checkRange (Range range, String str, int least){
+    String message;
+    assert (range != null);
+    assert (str != null);
+    if( range.getMin() < least ){
+      message = "minimum number("+range.getMin()+") of " + str + " must be >= "+least;
+      printErrAndExit (message);
+    }else if( range.getMax() < least ){
+      message = "maximum number("+range.getMax()+") of " + str + " must be >= "+least;
+      printErrAndExit (message);     
+    }else if( range.isEmpty() ){
+      message = "minimum number("+range.getMin()+") of " + str + " must be <= maximum("+range.getMax()+")";
+      printErrAndExit (message);
+    }
   }
 
   private static void printHelpAndExit () {
@@ -3197,263 +3966,278 @@ public class FuzzSMT {
   private static final String version = "0.2";
 
   private static final String usage = 
-"********************************************************************************\n" +
-"*              FuzzSMT " + version + "                                                     *\n"  +
-"*              Fuzzing Tool for SMT-LIB 1.2 Benchmarks                         *\n" +
-"*              written by Robert Daniel Brummayer, 2009                        *\n" + 
-"********************************************************************************\n" +
-"\n" +
-"usage: fuzzsmt <logic> [option...]\n\n" +
-"  <logic> is one of the following:\n" + 
-"  QF_A, QF_AUFBV, QF_AUFLIA, QF_AX, QF_BV, QF_IDL, QF_LIA, QF_LRA,\n" + 
-"  QF_NIA, QF_NRA, QF_RDL, QF_UF, QF_UFBV, QF_UFIDL, QF_UFLIA, QF_UFLRA,\n" +
-"  QF_UFNIA, QF_UFNRA, QF_UFRDL, AUFLIA, AUFLIRA and AUFNIRA.\n" + 
-"\n" +
-"  for details about SMT see: www.smtlib.org\n" +
-"\n" +
-"  general options:\n\n" + 
-"  -h                   print usage information and exit\n" +
-"  -V                   print version and exit\n" +
-"  -seed <seed>         initialize random number generator with <seed>\n" +
-"\n" +
-"  -bool-random         generate a random boolean layer (default)\n" +
-"  -bool-and            use an n-ary AND for the boolean layer\n" +
-"  -bool-or             use an n-ary OR for the boolean layer\n" +
-"  -bool-cnf <f>        generate a boolean CNF layer\n" +
-"                       with <f> * <literals> clauses\n" +
-"\n" +
-"QF_A and QF_AX options:\n" +
-"  -mar <arrays>        use min <arrays> array variables       (default  1)\n" +
-"  -Mar <arrays>        use max <arrays> array variables       (default  3)\n" +
-"  -mi <indices>        use min <indices> index variables      (default  1)\n" +
-"  -Mi <indices>        use max <indices> index variables      (default  5)\n" +
-"  -me <elements>       use min <elements> element variables   (default  1)\n" +
-"  -Me <elements>       use max <elements> element variables   (default  5)\n" +
-"  -mr <reads>          use min <reads> reads                  (default  1)\n" +
-"  -Mr <reads>          use max <reads> reads                  (default 10)\n" +
-"  -mw <writes>         use min <writes> writes                (default  0)\n" +
-"  -Mw <writes>         use max <writes> writes                (default 10)\n" +
-"  -ref <refs>          set min number of references for terms\n" +
-"                       in input and main layer to <refs>      (default  1)\n" +
-"\n" +
-"QF_AUFBV options:\n" +
-"  -mv <vars>           use min <vars> bit-vector variables    (default  1)\n" +
-"  -Mv <vars>           use max <vars> bit-vector variables    (default  5)\n" +
-"  -mc <consts>         use min <const> bit-vector constants   (default  1)\n" +
-"  -Mc <consts>         use max <const> bit-vector constants   (default  2)\n" +
-"  -mar <arrays>        use min <arrays> array variables       (default  1)\n" +
-"  -Mar <arrays>        use max <arrays> array variables       (default  3)\n" +
-"  -mr <reads>          use min <reads> reads                  (default  1)\n" +
-"  -Mr <reads>          use max <reads> reads                  (default  5)\n" +
-"  -mw <writes>         use min <writes> writes                (default  0)\n" +
-"  -Mw <writes>         use max <writes> writes                (default  5)\n" +
-"  -mxn <n>             compare min <n> arrays for equality    (default  0)\n" +
-"  -Mxn <n>             compare max <n> arrays for equality    (default  0)\n" +
-"  -mbw <bw>            set min bit-width to <bw>              (default  1)\n" +
-"  -Mbw <bw>            set max bit-width to <bw>              (default 16)\n" +
-"  -mf <funcs>          use min <funcs> uninterpreted BV funcs (default  0)\n" +
-"  -Mf <funcs>          use max <funcs> uninterpreted BV funcs (default  0)\n" +
-"  -mp <preds>          use min <preds> uninterpreted BV preds (default  0)\n" +
-"  -Mp <preds>          use max <preds> uninterpreted BV preds (default  0)\n" +
-"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
-"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
-"  -g                   do not guard BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n"+
-"  -n                   do not use BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n" +
-"  -ref <refs>          set min number of references for terms\n" + 
-"                       in input and main layer to <refs>      (default  1)\n" +
-"\n" +
-"QF_AUFLIA and AUFLIA options:\n" +
-"  -mv <vars>           use min <vars> integer variables       (default  1)\n" +
-"  -Mv <vars>           use max <vars> integer variables       (default  3)\n" +
-"  -mc <consts>         use min <const> integer constants      (default  1)\n" +
-"  -Mc <consts>         use max <const> integer constants      (default  3)\n" +
-"  -mar <arrays>        use min <arrays> array variables       (default  1)\n" +
-"  -Mar <arrays>        use max <arrays> array variables       (default  3)\n" +
-"  -mr <reads>          use min <reads> reads                  (default  1)\n" +
-"  -Mr <reads>          use max <reads> reads                  (default  5)\n" +
-"  -mw <writes>         use min <writes> writes                (default  0)\n" +
-"  -Mw <writes>         use max <writes> writes                (default  5)\n" +
-"  -x                   compare arrays for equality            (default no)\n" +
-"  -mfi <f>             use min <f> uninterpreted int funcs    (default  1)\n" +
-"  -Mfi <f>             use max <f> uninterpreted int funcs    (default  1)\n" +
-"  -mfar <f>            use min <f> uninterpreted array funcs  (default  1)\n" +
-"  -Mfar <f>            use max <f> uninterpreted array funcs  (default  1)\n" +
-"  -mpi <p>             use min <p> uninterpreted int preds    (default  1)\n" +
-"  -Mpi <p>             use max <p> uninterpreted int preds    (default  1)\n" +
-"  -mpar <p>            use min <p> uninterpreted array preds  (default  1)\n" +
-"  -Mpar <p>            use max <p> uninterpreted array preds  (default  1)\n" +
-"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
-"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
-"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
-"                       bit-width is used to\n" +
-"                       restrict the constants\n" +
-"  -ref <refs>          set min number of references for terms\n" + 
-"                       in input and main layer to <refs>      (default  1)\n" +
-" AUFLIA only:\n" +
-"  -mqfi <qf>           use min <qf> quantified formulas over\n" +
-"                       integer function and predicates        (default  1)\n" +
-"  -Mqfi <qf>           use max <qf> quantified formulas over\n" +
-"                       integer function and predicates        (default  1)\n" +
-"  -mqfar <qf>          use min <qf> quantified formulas over\n" +
-"                       array function and predicates          (default  0)\n" +
-"  -Mqfar <qf>          use max <qf> quantified formulas over\n" +
-"                       array function and predicates          (default  0)\n" +
-"  -mqv <qv>            set min number of quantified\n" +
-"                       variables per quantifier to <qn>       (default  1)\n" +
-"  -Mqv <qv>            set max number of quantified\n" +
-"                       variables per quantifier to <qn>       (default  3)\n" +
-"  -mqn <qn>            set min quantifier nesting\n" +
-"                       level to <qn>                          (default  0)\n" +
-"  -Mqn <qn>            set max quantifier nesting\n" +
-"                       level to <qn>                          (default  1)\n" +
-"\n" +
-"AUFLIRA and AUFNIRA options:\n" +
-"  -mvi <vars>          use min <vars> integer variables       (default  1)\n" +
-"  -Mvi <vars>          use max <vars> integer variables       (default  2)\n" +
-"  -mvr <vars>          use min <vars> real variables          (default  1)\n" +
-"  -Mvr <vars>          use max <vars> real variables          (default  2)\n" +
-"  -mci <consts>        use min <const> integer constants      (default  1)\n" +
-"  -Mci <consts>        use max <const> integer constants      (default  3)\n" +
-"  -mcr <consts>        use min <const> real constants         (default  1)\n" +
-"  -Mcr <consts>        use max <const> real constants         (default  3)\n" +
-"  -mar1 <arrays>       use min <arrays> array1 variables      (default  1)\n" +
-"  -Mar1 <arrays>       use max <arrays> array1 variables      (default  2)\n" +
-"  -mar2 <arrays>       use min <arrays> array2 variables      (default  1)\n" +
-"  -Mar2 <arrays>       use max <arrays> array2 variables      (default  2)\n" +
-"  -mr1 <reads>         use min <reads> reads on array1 terms  (default  1)\n" +
-"  -Mr1 <reads>         use max <reads> reads on array1 terms  (default  4)\n" +
-"  -mr2 <reads>         use min <reads> reads on array2 terms  (default  1)\n" +
-"  -Mr2 <reads>         use max <reads> reads on array2 terms  (default  4)\n" +
-"  -mw1 <writes>        use min <writes> writes on array1 terms(default  0)\n" +
-"  -Mw1 <writes>        use max <writes> writes on array1 terms(default  3)\n" +
-"  -mw2 <writes>        use min <writes> writes on array2 terms(default  0)\n" +
-"  -Mw2 <writes>        use max <writes> writes on array2 terms(default  3)\n" +
-"  -x1                  compare array1 terms for equality      (default no)\n" +
-"  -x2                  compare array2 terms for equality      (default no)\n" +
-"  -mfi <f>             use min <f> uninterpreted int funcs    (default  1)\n" +
-"  -Mfi <f>             use max <f> uninterpreted int funcs    (default  1)\n" +
-"  -mfr <f>             use min <f> uninterpreted real funcs   (default  1)\n" +
-"  -Mfr <f>             use max <f> uninterpreted real funcs   (default  1)\n" +
-"  -mfar1 <f>           use min <f> uninterpreted array1 funcs (default  1)\n" +
-"  -Mfar1 <f>           use max <f> uninterpreted array1 funcs (default  1)\n" +
-"  -mfar2 <f>           use min <f> uninterpreted array2 funcs (default  1)\n" +
-"  -Mfar2 <f>           use max <f> uninterpreted array2 funcs (default  1)\n" +
-"  -mpi <p>             use min <p> uninterpreted int preds    (default  1)\n" +
-"  -Mpi <p>             use max <p> uninterpreted int preds    (default  1)\n" +
-"  -mpr <p>             use min <p> uninterpreted real preds   (default  1)\n" +
-"  -Mpr <p>             use max <p> uninterpreted real preds   (default  1)\n" +
-"  -mpar1 <p>           use min <p> uninterpreted array1 preds (default  1)\n" +
-"  -Mpar1 <p>           use max <p> uninterpreted array1 preds (default  1)\n" +
-"  -mpar2 <p>           use min <p> uninterpreted array2 preds (default  1)\n" +
-"  -Mpar2 <p>           use max <p> uninterpreted array2 preds (default  1)\n" +
-"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
-"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
-"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
-"                       bit-width is used to\n" +
-"                       restrict the constants\n" +
-"  -mqfi <qf>           use min <qf> quantified formulas over\n" +
-"                       integer function and predicates        (default  1)\n" +
-"  -Mqfi <qf>           use max <qf> quantified formulas over\n" +
-"                       integer function and predicates        (default  1)\n" +
-"  -mqfr <qf>           use min <qf> quantified formulas over\n" +
-"                       real function and predicates           (default  1)\n" +
-"  -Mqfr <qf>           use max <qf> quantified formulas over\n" +
-"                       real function and predicates           (default  1)\n" +
-"  -mqfar1 <qf>         use min <qf> quantified formulas over\n" +
-"                       array1 function and predicates         (default  0)\n" +
-"  -Mqfar1 <qf>         use max <qf> quantified formulas over\n" +
-"                       array1 function and predicates         (default  0)\n" +
-"  -mqfar2 <qf>         use min <qf> quantified formulas over\n" +
-"                       array2 function and predicates         (default  0)\n" +
-"  -Mqfar2 <qf>         use max <qf> quantified formulas over\n" +
-"                       array2 function and predicates         (default  0)\n" +
-"  -mqv <qv>            set minimum number of quantified\n" +
-"                       variables per quantifier to <qn>       (default  1)\n" +
-"  -Mqv <qv>            set maximum number of quantified\n" +
-"                       variables per quantifier to <qn>       (default  3)\n" +
-"  -mqn <qn>            set minimum quantifier nesting\n" +
-"                       level to <qn>                          (default  0)\n" +
-"  -Mqn <qn>            set maximum quantifier nesting\n" +
-"                       level to <qn>                          (default  1)\n" +
-"  -ref <refs>          set min number of references for terms\n" + 
-"                       in input and main layer to <refs>      (default  1)\n" +
-"\n" +
-"QF_BV and QF_UFBV options:\n" +
-"  -mv <vars>           use min <vars> bit-vector variables    (default  1)\n" +
-"  -Mv <vars>           use max <vars> bit-vector variables    (default  5)\n" +
-"  -mc <consts>         use min <const> bit-vector constants   (default  1)\n" +
-"  -Mc <consts>         use max <const> bit-vector constants   (default  2)\n" +
-"  -mbw <bw>            set min bit-width to <bw>              (default  1)\n" +
-"  -Mbw <bw>            set max bit-width to <bw>              (default 16)\n" +
-"  -g                   do not guard BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n"+
-"  -n                   do not use BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n" +
-"  -ref <refs>          set min number of references for terms\n" +
-"                       in input and main layer to <refs>      (default  1)\n" +
-"\n" +
-" QF_UFBV only:\n" +
-"  -mf <funcs>          use min <funcs> uninterpreted funcs    (default  1)\n" +
-"  -Mf <funcs>          use max <funcs> uninterpreted funcs    (default  2)\n" +
-"  -mp <preds>          use min <preds> uninterpreted preds    (default  1)\n" +
-"  -Mp <preds>          use max <preds> uninterpreted preds    (default  2)\n" +
-"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
-"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
-"\n" +
-"QF_IDL, QF_UFIDL, QF_RDL and QF_UFRDL options:\n" +
-"  -mv <vars>           use min <vars> variables               (default  1)\n" +
-"  -Mv <vars>           use max <vars> variables               (default  8)\n" +
-"  -mc <consts>         use min <const> integer constants      (default  1)\n" +
-"  -Mc <consts>         use max <const> integer constants      (default  6)\n" +
-"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
-"                       bit-width is used to\n" +
-"                       restrict the constants\n" +
-"  -ref <refs>          set minimum number of references\n" +  
-"                       for vars and consts to <refs>          (default  5)\n" +
-" QF_UFIDL and QF_UFRDL only:\n" +
-"  -mf <funcs>          use min <funcs> uninterpreted funcs    (default  1)\n" +
-"  -Mf <funcs>          use max <funcs> uninterpreted funcs    (default  2)\n" +
-"  -mp <preds>          use min <preds> uninterpreted preds    (default  1)\n" +
-"  -Mp <preds>          use max <preds> uninterpreted preds    (default  2)\n" +
-"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
-"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
-"\n" +
-"QF_LIA, QF_UFLIA, QF_NIA, QF_UFNIA, QF_LRA,\n" +  
-"QF_UFLRA, QF_NRA and QF_UFNRA options:\n" +
-"  -mv <vars>           use min <vars> variables               (default  1)\n" +
-"  -Mv <vars>           use max <vars> variables               (default  3)\n" +
-"  -mc <consts>         use min <const> integer constants      (default  1)\n" +
-"  -Mc <consts>         use max <const> integer constants      (default  3)\n" +
-"                       in the real context, integer constants\n" +
-"                       are used, amongst others, to generate\n" +
-"                       real constants of the form (c1 / c2)\n" +
-"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
-"                       bit-width is used to\n" +
-"                       restrict the constants\n" +
-"  -ref <refs>          set minimum number of references\n" +  
-"                       for vars and consts to <refs>          (default  1)\n" +
-" QF_UFLIA, QF_UFNIA, QF_UFLRA and QF_UFNRA only:\n" +
-"  -mf <funcs>          use min <funcs> uninterpreted funcs    (default  1)\n" +
-"  -Mf <funcs>          use max <funcs> uninterpreted funcs    (default  2)\n" +
-"  -mp <preds>          use min <preds> uninterpreted preds    (default  1)\n" +
-"  -Mp <preds>          use max <preds> uninterpreted preds    (default  2)\n" +
-"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
-"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
-"\n" +
-"QF_UF options:\n" +
-"  -ms <sorts>          use min <sorts> sorts                  (default  1)\n" +
-"  -Ms <sorts>          use max <sorts> sorts                  (default  3)\n" +
-"  -mv <vars>           use min <vars> variables for each sort (default  1)\n" +
-"  -Mv <vars>           use max <vars> variables for each sort (default  3)\n" +
-"  -mf <funcs>          use at least <funcs> functions         (default  5)\n" +
-"  -mp <preds>          use at least <preds> predicates        (default  5)\n" +
-"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
-"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
-"  -ref <refs>          set min number of references for terms\n" + 
-"                       in input and main layer to <refs>      (default  1)\n" +
-"\n";
+		"********************************************************************************\n" +
+		"*              FuzzSMT " + version + "                                                     *\n"  +
+		"*              Fuzzing Tool for SMT-LIB 1.2 Benchmarks                         *\n" +
+		"*              written by Robert Daniel Brummayer, 2009                        *\n" + 
+		"********************************************************************************\n" +
+		"\n" +
+		"usage: fuzzsmt <logic> [option...]\n\n" +
+		"  <logic> is one of the following:\n" + 
+		"  QF_A, QF_AUFBV, QF_AUFLIA, QF_AX, QF_BV, QF_IDL, QF_LIA, QF_LRA,\n" + 
+		"  QF_NIA, QF_NRA, QF_RDL, QF_UF, QF_UFBV, QF_UFIDL, QF_UFLIA, QF_UFLRA,\n" +
+		"  QF_UFNIA, QF_UFNRA, QF_UFRDL, AUFLIA, AUFLIRA and AUFNIRA.\n" + 
+		"\n" +
+		"  for details about SMT see: www.smtlib.org\n" +
+		"\n" +
+		"  general options:\n\n" + 
+		"  -h                   print usage information and exit\n" +
+		"  -V                   print version and exit\n" +
+		"  -seed <seed>         initialize random number generator with <seed>\n" +
+		"\n" +
+		"  -bool-random         generate a random boolean layer (default)\n" +
+		"  -bool-and            use an n-ary AND for the boolean layer\n" +
+		"  -bool-or             use an n-ary OR for the boolean layer\n" +
+		"  -bool-cnf <f>        generate a boolean CNF layer\n" +
+		"                       with <f> * <literals> clauses\n" +
+		"\n" +
+		"QF_A and QF_AX options:\n" +
+		"  -mar <arrays>        use min <arrays> array variables       (default  1)\n" +
+		"  -Mar <arrays>        use max <arrays> array variables       (default  3)\n" +
+		"  -mi <indices>        use min <indices> index variables      (default  1)\n" +
+		"  -Mi <indices>        use max <indices> index variables      (default  5)\n" +
+		"  -me <elements>       use min <elements> element variables   (default  1)\n" +
+		"  -Me <elements>       use max <elements> element variables   (default  5)\n" +
+		"  -mr <reads>          use min <reads> reads                  (default  1)\n" +
+		"  -Mr <reads>          use max <reads> reads                  (default 10)\n" +
+		"  -mw <writes>         use min <writes> writes                (default  0)\n" +
+		"  -Mw <writes>         use max <writes> writes                (default 10)\n" +
+		"  -ref <refs>          set min number of references for terms\n" +
+		"                       in input and main layer to <refs>      (default  1)\n" +
+		"\n" +
+		"QF_AUFBV options:\n" +
+		"  -mv <vars>           use min <vars> bit-vector variables    (default  1)\n" +
+		"  -Mv <vars>           use max <vars> bit-vector variables    (default  5)\n" +
+		"  -mc <consts>         use min <const> bit-vector constants   (default  1)\n" +
+		"  -Mc <consts>         use max <const> bit-vector constants   (default  2)\n" +
+		"  -mar <arrays>        use min <arrays> array variables       (default  1)\n" +
+		"  -Mar <arrays>        use max <arrays> array variables       (default  3)\n" +
+		"  -mr <reads>          use min <reads> reads                  (default  1)\n" +
+		"  -Mr <reads>          use max <reads> reads                  (default  5)\n" +
+		"  -mw <writes>         use min <writes> writes                (default  0)\n" +
+		"  -Mw <writes>         use max <writes> writes                (default  5)\n" +
+		"  -mxn <n>             compare min <n> arrays for equality    (default  0)\n" +
+		"  -Mxn <n>             compare max <n> arrays for equality    (default  0)\n" +
+		"  -mbw <bw>            set min bit-width to <bw>              (default  1)\n" +
+		"  -Mbw <bw>            set max bit-width to <bw>              (default 16)\n" +
+		"  -mf <funcs>          use min <funcs> uninterpreted BV funcs (default  0)\n" +
+		"  -Mf <funcs>          use max <funcs> uninterpreted BV funcs (default  0)\n" +
+		"  -mp <preds>          use min <preds> uninterpreted BV preds (default  0)\n" +
+		"  -Mp <preds>          use max <preds> uninterpreted BV preds (default  0)\n" +
+		"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
+		"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
+		"  -g                   do not guard BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n"+
+		"  -n                   do not use BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n" +
+		"  -ref <refs>          set min number of references for terms\n" + 
+		"                       in input and main layer to <refs>      (default  1)\n" +
+		"\n" +
+		"QF_AUFLIA and AUFLIA options:\n" +
+		"  -mv <vars>           use min <vars> integer variables       (default  1)\n" +
+		"  -Mv <vars>           use max <vars> integer variables       (default  3)\n" +
+		"  -mc <consts>         use min <const> integer constants      (default  1)\n" +
+		"  -Mc <consts>         use max <const> integer constants      (default  3)\n" +
+		"  -mar <arrays>        use min <arrays> array variables       (default  1)\n" +
+		"  -Mar <arrays>        use max <arrays> array variables       (default  3)\n" +
+		"  -mr <reads>          use min <reads> reads                  (default  1)\n" +
+		"  -Mr <reads>          use max <reads> reads                  (default  5)\n" +
+		"  -mw <writes>         use min <writes> writes                (default  0)\n" +
+		"  -Mw <writes>         use max <writes> writes                (default  5)\n" +
+		"  -x                   compare arrays for equality            (default no)\n" +
+		"  -mfi <f>             use min <f> uninterpreted int funcs    (default  1)\n" +
+		"  -Mfi <f>             use max <f> uninterpreted int funcs    (default  1)\n" +
+		"  -mfar <f>            use min <f> uninterpreted array funcs  (default  1)\n" +
+		"  -Mfar <f>            use max <f> uninterpreted array funcs  (default  1)\n" +
+		"  -mpi <p>             use min <p> uninterpreted int preds    (default  1)\n" +
+		"  -Mpi <p>             use max <p> uninterpreted int preds    (default  1)\n" +
+		"  -mpar <p>            use min <p> uninterpreted array preds  (default  1)\n" +
+		"  -Mpar <p>            use max <p> uninterpreted array preds  (default  1)\n" +
+		"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
+		"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
+		"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
+		"                       bit-width is used to\n" +
+		"                       restrict the constants\n" +
+		"  -ref <refs>          set min number of references for terms\n" + 
+		"                       in input and main layer to <refs>      (default  1)\n" +
+		" AUFLIA only:\n" +
+		"  -mqfi <qf>           use min <qf> quantified formulas over\n" +
+		"                       integer function and predicates        (default  1)\n" +
+		"  -Mqfi <qf>           use max <qf> quantified formulas over\n" +
+		"                       integer function and predicates        (default  1)\n" +
+		"  -mqfar <qf>          use min <qf> quantified formulas over\n" +
+		"                       array function and predicates          (default  0)\n" +
+		"  -Mqfar <qf>          use max <qf> quantified formulas over\n" +
+		"                       array function and predicates          (default  0)\n" +
+		"  -mqv <qv>            set min number of quantified\n" +
+		"                       variables per quantifier to <qn>       (default  1)\n" +
+		"  -Mqv <qv>            set max number of quantified\n" +
+		"                       variables per quantifier to <qn>       (default  3)\n" +
+		"  -mqn <qn>            set min quantifier nesting\n" +
+		"                       level to <qn>                          (default  0)\n" +
+		"  -Mqn <qn>            set max quantifier nesting\n" +
+		"                       level to <qn>                          (default  1)\n" +
+		"\n" +
+		"AUFLIRA and AUFNIRA options:\n" +
+		"  -mvi <vars>          use min <vars> integer variables       (default  1)\n" +
+		"  -Mvi <vars>          use max <vars> integer variables       (default  2)\n" +
+		"  -mvr <vars>          use min <vars> real variables          (default  1)\n" +
+		"  -Mvr <vars>          use max <vars> real variables          (default  2)\n" +
+		"  -mci <consts>        use min <const> integer constants      (default  1)\n" +
+		"  -Mci <consts>        use max <const> integer constants      (default  3)\n" +
+		"  -mcr <consts>        use min <const> real constants         (default  1)\n" +
+		"  -Mcr <consts>        use max <const> real constants         (default  3)\n" +
+		"  -mar1 <arrays>       use min <arrays> array1 variables      (default  1)\n" +
+		"  -Mar1 <arrays>       use max <arrays> array1 variables      (default  2)\n" +
+		"  -mar2 <arrays>       use min <arrays> array2 variables      (default  1)\n" +
+		"  -Mar2 <arrays>       use max <arrays> array2 variables      (default  2)\n" +
+		"  -mr1 <reads>         use min <reads> reads on array1 terms  (default  1)\n" +
+		"  -Mr1 <reads>         use max <reads> reads on array1 terms  (default  4)\n" +
+		"  -mr2 <reads>         use min <reads> reads on array2 terms  (default  1)\n" +
+		"  -Mr2 <reads>         use max <reads> reads on array2 terms  (default  4)\n" +
+		"  -mw1 <writes>        use min <writes> writes on array1 terms(default  0)\n" +
+		"  -Mw1 <writes>        use max <writes> writes on array1 terms(default  3)\n" +
+		"  -mw2 <writes>        use min <writes> writes on array2 terms(default  0)\n" +
+		"  -Mw2 <writes>        use max <writes> writes on array2 terms(default  3)\n" +
+		"  -x1                  compare array1 terms for equality      (default no)\n" +
+		"  -x2                  compare array2 terms for equality      (default no)\n" +
+		"  -mfi <f>             use min <f> uninterpreted int funcs    (default  1)\n" +
+		"  -Mfi <f>             use max <f> uninterpreted int funcs    (default  1)\n" +
+		"  -mfr <f>             use min <f> uninterpreted real funcs   (default  1)\n" +
+		"  -Mfr <f>             use max <f> uninterpreted real funcs   (default  1)\n" +
+		"  -mfar1 <f>           use min <f> uninterpreted array1 funcs (default  1)\n" +
+		"  -Mfar1 <f>           use max <f> uninterpreted array1 funcs (default  1)\n" +
+		"  -mfar2 <f>           use min <f> uninterpreted array2 funcs (default  1)\n" +
+		"  -Mfar2 <f>           use max <f> uninterpreted array2 funcs (default  1)\n" +
+		"  -mpi <p>             use min <p> uninterpreted int preds    (default  1)\n" +
+		"  -Mpi <p>             use max <p> uninterpreted int preds    (default  1)\n" +
+		"  -mpr <p>             use min <p> uninterpreted real preds   (default  1)\n" +
+		"  -Mpr <p>             use max <p> uninterpreted real preds   (default  1)\n" +
+		"  -mpar1 <p>           use min <p> uninterpreted array1 preds (default  1)\n" +
+		"  -Mpar1 <p>           use max <p> uninterpreted array1 preds (default  1)\n" +
+		"  -mpar2 <p>           use min <p> uninterpreted array2 preds (default  1)\n" +
+		"  -Mpar2 <p>           use max <p> uninterpreted array2 preds (default  1)\n" +
+		"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
+		"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
+		"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
+		"                       bit-width is used to\n" +
+		"                       restrict the constants\n" +
+		"  -mqfi <qf>           use min <qf> quantified formulas over\n" +
+		"                       integer function and predicates        (default  1)\n" +
+		"  -Mqfi <qf>           use max <qf> quantified formulas over\n" +
+		"                       integer function and predicates        (default  1)\n" +
+		"  -mqfr <qf>           use min <qf> quantified formulas over\n" +
+		"                       real function and predicates           (default  1)\n" +
+		"  -Mqfr <qf>           use max <qf> quantified formulas over\n" +
+		"                       real function and predicates           (default  1)\n" +
+		"  -mqfar1 <qf>         use min <qf> quantified formulas over\n" +
+		"                       array1 function and predicates         (default  0)\n" +
+		"  -Mqfar1 <qf>         use max <qf> quantified formulas over\n" +
+		"                       array1 function and predicates         (default  0)\n" +
+		"  -mqfar2 <qf>         use min <qf> quantified formulas over\n" +
+		"                       array2 function and predicates         (default  0)\n" +
+		"  -Mqfar2 <qf>         use max <qf> quantified formulas over\n" +
+		"                       array2 function and predicates         (default  0)\n" +
+		"  -mqv <qv>            set minimum number of quantified\n" +
+		"                       variables per quantifier to <qn>       (default  1)\n" +
+		"  -Mqv <qv>            set maximum number of quantified\n" +
+		"                       variables per quantifier to <qn>       (default  3)\n" +
+		"  -mqn <qn>            set minimum quantifier nesting\n" +
+		"                       level to <qn>                          (default  0)\n" +
+		"  -Mqn <qn>            set maximum quantifier nesting\n" +
+		"                       level to <qn>                          (default  1)\n" +
+		"  -ref <refs>          set min number of references for terms\n" + 
+		"                       in input and main layer to <refs>      (default  1)\n" +
+		"\n" +
+		"QF_BV and QF_UFBV options:\n" +
+		"  -mv <vars>           use min <vars> bit-vector variables    (default  1)\n" +
+		"  -Mv <vars>           use max <vars> bit-vector variables    (default  5)\n" +
+		"  -mc <consts>         use min <const> bit-vector constants   (default  1)\n" +
+		"  -Mc <consts>         use max <const> bit-vector constants   (default  2)\n" +
+		"  -mbw <bw>            set min bit-width to <bw>              (default  1)\n" +
+		"  -Mbw <bw>            set max bit-width to <bw>              (default 16)\n" +
+		"  -g                   do not guard BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n"+
+		"  -n                   do not use BVUDIV BVSDIV BVUREM BVSREM BVSMOD\n" +
+		"  -ref <refs>          set min number of references for terms\n" +
+		"                       in input and main layer to <refs>      (default  1)\n" +
+		"\n" +
+		" QF_UFBV only:\n" +
+		"  -mf <funcs>          use min <funcs> uninterpreted funcs    (default  1)\n" +
+		"  -Mf <funcs>          use max <funcs> uninterpreted funcs    (default  2)\n" +
+		"  -mp <preds>          use min <preds> uninterpreted preds    (default  1)\n" +
+		"  -Mp <preds>          use max <preds> uninterpreted preds    (default  2)\n" +
+		"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
+		"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
+		"\n" +
+		"QF_IDL, QF_UFIDL, QF_RDL and QF_UFRDL options:\n" +
+		"  -mv <vars>           use min <vars> variables               (default  1)\n" +
+		"  -Mv <vars>           use max <vars> variables               (default  8)\n" +
+		"  -mc <consts>         use min <const> integer constants      (default  1)\n" +
+		"  -Mc <consts>         use max <const> integer constants      (default  6)\n" +
+		"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
+		"                       bit-width is used to\n" +
+		"                       restrict the constants\n" +
+		"  -ref <refs>          set minimum number of references\n" +  
+		"                       for vars and consts to <refs>          (default  5)\n" +
+		" QF_UFIDL and QF_UFRDL only:\n" +
+		"  -mf <funcs>          use min <funcs> uninterpreted funcs    (default  1)\n" +
+		"  -Mf <funcs>          use max <funcs> uninterpreted funcs    (default  2)\n" +
+		"  -mp <preds>          use min <preds> uninterpreted preds    (default  1)\n" +
+		"  -Mp <preds>          use max <preds> uninterpreted preds    (default  2)\n" +
+		"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
+		"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
+		"\n" +
+		"QF_LIA, QF_UFLIA, QF_NIA, QF_UFNIA, QF_LRA,\n" +  
+		"QF_UFLRA, QF_NRA and QF_UFNRA options:\n" +
+		"  -mv <vars>           use min <vars> variables               (default  1)\n" +
+		"  -Mv <vars>           use max <vars> variables               (default  3)\n" +
+		"  -mc <consts>         use min <const> integer constants      (default  1)\n" +
+		"  -Mc <consts>         use max <const> integer constants      (default  3)\n" +
+		"                       in the real context, integer constants\n" +
+		"                       are used, amongst others, to generate\n" +
+		"                       real constants of the form (c1 / c2)\n" +
+		"  -Mbw <bw>            set max bit-width to <bw>              (default  4)\n" +
+		"                       bit-width is used to\n" +
+		"                       restrict the constants\n" +
+		"  -ref <refs>          set minimum number of references\n" +  
+		"                       for vars and consts to <refs>          (default  1)\n" +
+		" QF_UFLIA, QF_UFNIA, QF_UFLRA and QF_UFNRA only:\n" +
+		"  -mf <funcs>          use min <funcs> uninterpreted funcs    (default  1)\n" +
+		"  -Mf <funcs>          use max <funcs> uninterpreted funcs    (default  2)\n" +
+		"  -mp <preds>          use min <preds> uninterpreted preds    (default  1)\n" +
+		"  -Mp <preds>          use max <preds> uninterpreted preds    (default  2)\n" +
+		"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
+		"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
+		"\n" +
+		"QF_UF options:\n" +
+		"  -ms <sorts>          use min <sorts> sorts                  (default  1)\n" +
+		"  -Ms <sorts>          use max <sorts> sorts                  (default  3)\n" +
+		"  -mv <vars>           use min <vars> variables for each sort (default  1)\n" +
+		"  -Mv <vars>           use max <vars> variables for each sort (default  3)\n" +
+		"  -mf <funcs>          use at least <funcs> functions         (default  5)\n" +
+		"  -mp <preds>          use at least <preds> predicates        (default  5)\n" +
+		"  -ma <args>           set min number of arguments to <args>  (default  1)\n" +
+		"  -Ma <args>           set max number of arguments to <args>  (default  3)\n" +
+		"  -ref <refs>          set min number of references for terms\n" + 
+		"                       in input and main layer to <refs>      (default  1)\n" +
+		"\n" +
+		"QF_FP options:\n" +
+		"  -mv <vars>           use min <vars> variables               (default  1)\n" +
+		"  -Mv <vars>           use max <vars> variables               (default  5)\n" +
+		"  -mc <consts>         use min <const> FP constants           (default  1)\n" +
+		"  -Mc <consts>         use max <const> FP constants           (default  3)\n" +
+		"  -mrm <rms>           set min number of rounding modes to <rms>  (default  1)\n" +
+		"  -Mrm <rms>           set max number of rounding modes to <rms>  (default  2)\n" +
+		"  -meb <eb>            set min width of exponent to <eb>      (default  2)\n" +
+		"  -Meb <eb>            set max width of exponent to <eb>      (default 11)\n" +
+		"  -msb <sb>            set min width to significand to <sb>   (default  2)\n" +
+		"  -Msb <sb>            set max width to significand to <sb>   (default 53)\n" +
+		"  -ref <refs>          set min number of references for terms\n" + 
+		"                       in input and main layer to <refs>      (default  1)\n" +
+		"\n";
 
   public static void main (String args[]) {
     SMTLogic logic = null;
     Random r = null;
+    long seed = 0;
     int pars = 1;
     int minRefs = 1;
     int minNumConsts = 1;
@@ -3584,6 +4368,13 @@ public class FuzzSMT {
     int minNumUPredsSets = 0;
     int maxNumUPredsSets = 0;
     int numUPredsSets = 0;
+
+    int numRoundingModes = 0;
+    Range numRoundingModesRange = new Range();
+    Range expBitsRange = new Range();
+    Range sigBitsRange = new Range();
+
+
     boolean linear = true;
     double factor = 1.0;
     RelCompMode compModeArray = RelCompMode.OFF;
@@ -3612,233 +4403,245 @@ public class FuzzSMT {
       printHelpAndExit ();
 
     switch (logic) {
-      case QF_A:
-	  System.out.println("QF_A is not an SMT-lib 2.0 category.");
-	  System.exit(0);
-      case QF_AX:
-        minNumArrays = 1;
-        maxNumArrays = 3;
-        minNumIndices = 1;
-        maxNumIndices = 5;
-        minNumElements = 1;
-        maxNumElements = 5;
-        minNumReads = 1;
-        maxNumReads = 10;
-        minNumWrites = 0;
-        maxNumWrites = 10;
-        break;
-      case QF_AUFBV:
-        minNumVars = 1;
-        maxNumVars = 5;
-        minNumConsts = 1;
-        maxNumConsts = 2;
-        minNumArrays = 1;
-        maxNumArrays = 3;
-        minNumReads = 1;
-        maxNumReads = 5;
-        minNumWrites = 0;
-        maxNumWrites = 5;
-        minNumExtBool = 0;
-        maxNumExtBool = 0;
-        minBW = 1;
-        maxBW = 16;
-        minNumUFuncs = 0;
-        maxNumUFuncs = 0;
-        minNumUPreds = 0;
-        maxNumUPreds = 0;
-        minArgs = 1;
-        maxArgs = 3;
-        bvDivMode = BVDivMode.GUARD;
-        break;
-      case AUFLIA:
-        minNumQFormulasInt = 1;
-        maxNumQFormulasInt = 1;
-        minNumQFormulasArray = 0;
-        maxNumQFormulasArray = 0;
-        minQVars = 1;
-        maxQVars = 3;
-        minQNestings = 0;
-        maxQNestings = 1;
-        /* fall through by intention */
-      case QF_AUFLIA:
-        minNumVars = 1;
-        maxNumVars = 3;
-        minNumConsts = 1;
-        maxNumConsts = 3;
-        minNumArrays = 1;
-        maxNumArrays = 3;
-        minNumReads = 1;
-        maxNumReads = 5;
-        minNumWrites = 0;
-        maxNumWrites = 5;
-        compModeArray = RelCompMode.OFF;
-        minNumUFuncsInt = 1;
-        maxNumUFuncsInt = 1;
-        minNumUFuncsArray = 1;
-        maxNumUFuncsArray = 1;
-        minNumUPredsInt = 1;
-        maxNumUPredsInt = 1;
-        minNumUPredsArray = 1;
-        maxNumUPredsArray = 1;
-        minArgs = 1;
-        maxArgs = 3;
-        maxBW = 4;
-        break;
-      case AUFNIRA:
-        linear = false;
-        /* fall through by intention */
-      case AUFLIRA:
-        minNumVarsInt = 1;
-        maxNumVarsInt = 2;
-        minNumVarsReal = 1;
-        maxNumVarsReal = 2;
-        minNumConstsInt = 1;
-        maxNumConstsInt = 3;
-        minNumConstsIntAsReal = 1;
-        maxNumConstsIntAsReal = 3;
-        minNumArrays1 = 1;
-        maxNumArrays1 = 2;
-        minNumArrays2 = 1;
-        maxNumArrays2 = 2;
-        minNumReadsArray1 = 1;
-        maxNumReadsArray1 = 4;
-        minNumReadsArray2 = 1;
-        maxNumReadsArray2 = 4;
-        minNumWritesArray1 = 0;
-        maxNumWritesArray1 = 3;
-        minNumWritesArray2 = 0;
-        maxNumWritesArray2 = 3;
-        compModeArray1 = RelCompMode.OFF;
-        compModeArray2 = RelCompMode.OFF;
-        minNumUFuncsInt = 1;
-        maxNumUFuncsInt = 1;
-        minNumUFuncsReal = 1;
-        maxNumUFuncsReal = 1;
-        minNumUFuncsArray1 = 1;
-        maxNumUFuncsArray1 = 1;
-        minNumUFuncsArray2 = 1;
-        maxNumUFuncsArray2 = 1;
-        minNumUPredsInt = 1;
-        maxNumUPredsInt = 1;
-        minNumUPredsReal = 1;
-        maxNumUPredsReal = 1;
-        minNumUPredsArray1 = 1;
-        maxNumUPredsArray1 = 1;
-        minNumUPredsArray2 = 1;
-        maxNumUPredsArray2 = 1;
-        minArgs = 1;
-        maxArgs = 3;
-        maxBW = 4;
-        minNumQFormulasInt = 1;
-        maxNumQFormulasInt = 1;
-        minNumQFormulasReal = 1;
-        maxNumQFormulasReal = 1;
-        minNumQFormulasArray1 = 0;
-        maxNumQFormulasArray1 = 0;
-        minNumQFormulasArray2 = 0;
-        maxNumQFormulasArray2 = 0;
-        minQVars = 1;
-        maxQVars = 3;
-        minQNestings = 0;
-        maxQNestings = 1;
-        break;
-      case QF_UFBV:
-        minNumUFuncs = 1;
-        maxNumUFuncs = 2;
-        minNumUPreds = 1;
-        maxNumUPreds = 2;
-        minArgs = 1;
-        maxArgs = 3;
-        /* fall through by intenion */
-      case QF_BV:
-        minNumVars = 1;
-        maxNumVars = 5;
-        minNumConsts = 1;
-        maxNumConsts = 2;
-        minBW = 1;
-        maxBW = 16;
-        bvDivMode = BVDivMode.GUARD;
-        break;
-      case QF_UFIDL:
-      case QF_UFRDL:
-        minNumUFuncs = 1;
-        maxNumUFuncs = 2;
-        minNumUPreds = 1;
-        maxNumUPreds = 2;
-        minArgs = 1;
-        maxArgs = 3;
-        /* fall through by intention */
-      case QF_IDL:
-      case QF_RDL:
-        minNumVars = 1;
-        maxNumVars = 8;
-        minNumConsts = 1;
-        maxNumConsts = 6;
-        maxBW = 4;
-        minRefs = 5;
-        break;
-      case QF_UFNIA:
-	  System.out.println("QF_UFNIA is not an SMT-lib 2.0 category.");
-	  System.exit(0);
-      case QF_UFLIA_SETS:
-        minNumSets = 1;
-        maxNumSets = 5;
-        minNumMembers = 1;
-        maxNumMembers = 30;
-        minNumUFuncsInt = 1;
-        maxNumUFuncsInt = 1;
-        minNumUFuncsSets = 1;
-        maxNumUFuncsSets = 1;
-        minNumUPredsInt = 1;
-        maxNumUPredsInt = 1;
-        minNumUPredsSets = 1;
-        maxNumUPredsSets = 1;
-        minArgs = 1;
-        maxArgs = 3;
-        maxBW = 4;
-        break;
-      case QF_UFNRA:
-      case QF_UFLIA:
-      case QF_UFLRA:
-        minNumUFuncs = 1;
-        maxNumUFuncs = 2;
-        minNumUPreds = 1;
-        maxNumUPreds = 2;
-        minArgs = 1;
-        maxArgs = 3;
-        /* fall through by intenion */
-      case QF_LIA:
-      case QF_NIA:
-      case QF_LRA:
-      case QF_NRA:
-        minNumVars = 1;
-        maxNumVars = 3;
-        minNumConsts = 1;
-        maxNumConsts = 3;
-        maxBW = 4;
-        switch (logic) {
-          case QF_NIA:
-          case QF_NRA:
-          case QF_UFNIA:
-          case QF_UFNRA:
-            linear = false;
-            break;
-          default:
-            break;
-        }
-        break;
-      case QF_UF:
-        minNumVars = 1;
-        maxNumVars = 3;
-        minNumSorts = 1;
-        maxNumSorts = 3;
-        minNumUFuncs = 5;
-        minNumUPreds = 5;
-        minArgs = 1;
-        maxArgs = 3;
-        break;
-      default:
-        assert (false);
+		case QF_A:
+			System.out.println("QF_A is not an SMT-lib 2.0 category.");
+			System.exit(0);
+		case QF_AX:
+			minNumArrays = 1;
+			maxNumArrays = 3;
+			minNumIndices = 1;
+			maxNumIndices = 5;
+			minNumElements = 1;
+			maxNumElements = 5;
+			minNumReads = 1;
+			maxNumReads = 10;
+			minNumWrites = 0;
+			maxNumWrites = 10;
+			break;
+		case QF_AUFBV:
+			minNumVars = 1;
+			maxNumVars = 5;
+			minNumConsts = 1;
+			maxNumConsts = 2;
+			minNumArrays = 1;
+			maxNumArrays = 3;
+			minNumReads = 1;
+			maxNumReads = 5;
+			minNumWrites = 0;
+			maxNumWrites = 5;
+			minNumExtBool = 0;
+			maxNumExtBool = 0;
+			minBW = 1;
+			maxBW = 16;
+			minNumUFuncs = 0;
+			maxNumUFuncs = 0;
+			minNumUPreds = 0;
+			maxNumUPreds = 0;
+			minArgs = 1;
+			maxArgs = 3;
+			bvDivMode = BVDivMode.GUARD;
+			break;
+		case AUFLIA:
+			minNumQFormulasInt = 1;
+			maxNumQFormulasInt = 1;
+			minNumQFormulasArray = 0;
+			maxNumQFormulasArray = 0;
+			minQVars = 1;
+			maxQVars = 3;
+			minQNestings = 0;
+			maxQNestings = 1;
+			/* fall through by intention */
+		case QF_AUFLIA:
+			minNumVars = 1;
+			maxNumVars = 3;
+			minNumConsts = 1;
+			maxNumConsts = 3;
+			minNumArrays = 1;
+			maxNumArrays = 3;
+			minNumReads = 1;
+			maxNumReads = 5;
+			minNumWrites = 0;
+			maxNumWrites = 5;
+			compModeArray = RelCompMode.OFF;
+			minNumUFuncsInt = 1;
+			maxNumUFuncsInt = 1;
+			minNumUFuncsArray = 1;
+			maxNumUFuncsArray = 1;
+			minNumUPredsInt = 1;
+			maxNumUPredsInt = 1;
+			minNumUPredsArray = 1;
+			maxNumUPredsArray = 1;
+			minArgs = 1;
+			maxArgs = 3;
+			maxBW = 4;
+			break;
+		case AUFNIRA:
+			linear = false;
+			/* fall through by intention */
+		case AUFLIRA:
+			minNumVarsInt = 1;
+			maxNumVarsInt = 2;
+			minNumVarsReal = 1;
+			maxNumVarsReal = 2;
+			minNumConstsInt = 1;
+			maxNumConstsInt = 3;
+			minNumConstsIntAsReal = 1;
+			maxNumConstsIntAsReal = 3;
+			minNumArrays1 = 1;
+			maxNumArrays1 = 2;
+			minNumArrays2 = 1;
+			maxNumArrays2 = 2;
+			minNumReadsArray1 = 1;
+			maxNumReadsArray1 = 4;
+			minNumReadsArray2 = 1;
+			maxNumReadsArray2 = 4;
+			minNumWritesArray1 = 0;
+			maxNumWritesArray1 = 3;
+			minNumWritesArray2 = 0;
+			maxNumWritesArray2 = 3;
+			compModeArray1 = RelCompMode.OFF;
+			compModeArray2 = RelCompMode.OFF;
+			minNumUFuncsInt = 1;
+			maxNumUFuncsInt = 1;
+			minNumUFuncsReal = 1;
+			maxNumUFuncsReal = 1;
+			minNumUFuncsArray1 = 1;
+			maxNumUFuncsArray1 = 1;
+			minNumUFuncsArray2 = 1;
+			maxNumUFuncsArray2 = 1;
+			minNumUPredsInt = 1;
+			maxNumUPredsInt = 1;
+			minNumUPredsReal = 1;
+			maxNumUPredsReal = 1;
+			minNumUPredsArray1 = 1;
+			maxNumUPredsArray1 = 1;
+			minNumUPredsArray2 = 1;
+			maxNumUPredsArray2 = 1;
+			minArgs = 1;
+			maxArgs = 3;
+			maxBW = 4;
+			minNumQFormulasInt = 1;
+			maxNumQFormulasInt = 1;
+			minNumQFormulasReal = 1;
+			maxNumQFormulasReal = 1;
+			minNumQFormulasArray1 = 0;
+			maxNumQFormulasArray1 = 0;
+			minNumQFormulasArray2 = 0;
+			maxNumQFormulasArray2 = 0;
+			minQVars = 1;
+			maxQVars = 3;
+			minQNestings = 0;
+			maxQNestings = 1;
+			break;
+		case QF_UFBV:
+			minNumUFuncs = 1;
+			maxNumUFuncs = 2;
+			minNumUPreds = 1;
+			maxNumUPreds = 2;
+			minArgs = 1;
+			maxArgs = 3;
+			/* fall through by intenion */
+		case QF_BV:
+			minNumVars = 1;
+			maxNumVars = 5;
+			minNumConsts = 1;
+			maxNumConsts = 2;
+			minBW = 1;
+			maxBW = 16;
+			bvDivMode = BVDivMode.GUARD;
+			break;		
+		case QF_UFIDL:
+		case QF_UFRDL:
+			minNumUFuncs = 1;
+			maxNumUFuncs = 2;
+			minNumUPreds = 1;
+			maxNumUPreds = 2;
+			minArgs = 1;
+			maxArgs = 3;
+			/* fall through by intention */
+		case QF_IDL:
+		case QF_RDL:
+			minNumVars = 1;
+			maxNumVars = 8;
+			minNumConsts = 1;
+			maxNumConsts = 6;
+			maxBW = 4;
+			minRefs = 5;
+			break;
+		case QF_UFNIA:
+			System.out.println("QF_UFNIA is not an SMT-lib 2.0 category.");
+			System.exit(0);
+		case QF_UFLIA_SETS:
+			minNumSets = 1;
+			maxNumSets = 5;
+			minNumMembers = 1;
+			maxNumMembers = 30;
+			minNumUFuncsInt = 1;
+			maxNumUFuncsInt = 1;
+			minNumUFuncsSets = 1;
+			maxNumUFuncsSets = 1;
+			minNumUPredsInt = 1;
+			maxNumUPredsInt = 1;
+			minNumUPredsSets = 1;
+			maxNumUPredsSets = 1;
+			minArgs = 1;
+			maxArgs = 3;
+			maxBW = 4;
+			break;
+		case QF_UFNRA:
+		case QF_UFLIA:
+		case QF_UFLRA:
+			minNumUFuncs = 1;
+			maxNumUFuncs = 2;
+			minNumUPreds = 1;
+			maxNumUPreds = 2;
+			minArgs = 1;
+			maxArgs = 3;
+			/* fall through by intenion */
+		case QF_LIA:
+		case QF_NIA:
+		case QF_LRA:
+		case QF_NRA:
+			minNumVars = 1;
+			maxNumVars = 3;
+			minNumConsts = 1;
+			maxNumConsts = 3;
+			maxBW = 4;
+			switch (logic) {
+			case QF_NIA:
+			case QF_NRA:
+			case QF_UFNIA:
+			case QF_UFNRA:
+				linear = false;
+				break;
+			default:
+				break;
+			}
+			break;
+		case QF_UF:
+			minNumVars = 1;
+			maxNumVars = 3;
+			minNumSorts = 1;
+			maxNumSorts = 3;
+			minNumUFuncs = 5;
+			minNumUPreds = 5;
+			minArgs = 1;
+			maxArgs = 3;
+			break;
+		case QF_FP:
+			minNumVars = 1;
+			maxNumVars = 5;
+			minNumConsts = 1;
+			maxNumConsts = 5;
+
+      numRoundingModesRange.setMinMax(1, 2);
+      expBitsRange.setMinMax(2, 11);
+      sigBitsRange.setMinMax(2, 53);
+
+			minRefs = 1;			
+			break;
+		default:
+			assert (false);
     }
 
     for (int i = 1; i < args.length; i++) {
@@ -3865,7 +4668,8 @@ public class FuzzSMT {
         } else if (arg.equals("-bool-or")) {
           booleanLayerKind = BooleanLayerKind.OR;
         } else if (arg.equals("-seed")) {
-          r = new Random (parseLongOption (args, i++, 0l, "invalid seed"));
+          seed = parseLongOption (args, i++, Long.MIN_VALUE, "invalid seed");
+          r = new Random (seed);
         } else if (arg.equals("-bool-cnf")) {
           factor = parseDoubleOption (args, i++, 0.0, "invalid CNF factor");
           booleanLayerKind = BooleanLayerKind.CNF;
@@ -4031,6 +4835,18 @@ public class FuzzSMT {
           minBW = parseIntOption (args, i++, 1, "invalid minimum bit-width");
         } else if (arg.equals("-Mbw")) {
           maxBW = parseIntOption (args, i++, 1, "invalid maximum bit-width");
+        } else if (arg.equals("-mrm")) {
+          numRoundingModesRange.setMin(parseIntOption (args, i++, 1, "invalid minimum rounding modes"));
+        } else if (arg.equals("-Mrm")) {
+          numRoundingModesRange.setMax(parseIntOption (args, i++, 1, "invalid maximum rounding modes"));
+        } else if (arg.equals("-meb")) {
+          expBitsRange.setMin(parseIntOption (args, i++, 2, "invalid minimum number of exponent bits"));
+        } else if (arg.equals("-Meb")) {
+          expBitsRange.setMax(parseIntOption (args, i++, 2, "invalid maximum number of exponent bits"));
+        } else if (arg.equals("-msb")) {
+          sigBitsRange.setMin(parseIntOption (args, i++, 2, "invalid minimum number of significand bits"));
+        } else if (arg.equals("-Msb")) {
+          sigBitsRange.setMax(parseIntOption (args, i++, 2, "invalid maximum number of significand bits"));
         } else { 
           printErrAndExit ("invalid option: " + arg);
         }
@@ -4039,1065 +4855,1102 @@ public class FuzzSMT {
       }
     }
 
-    if (r == null) /* seed has not been set */
+    if (r == null){ /* seed has not been set */
       r = new Random();
-
+      seed = r.nextLong();
+      r.setSeed(seed);
+    }
+    
     assert (numVars >= 0);
     assert (numConsts >= 0);
     assert (minRefs >= 1);
     switch (logic) {
-      case AUFLIRA:
-      case AUFNIRA:
-        assert (linear || logic != SMTLogic.AUFLIRA);
-        assert (!linear || logic != SMTLogic.AUFNIRA);
-        assert (minNumVarsInt > 0);
-        assert (maxNumVarsInt > 0);
-        assert (minNumVarsReal > 0);
-        assert (maxNumVarsReal > 0);
-        assert (minNumConstsInt > 0);
-        assert (maxNumConstsInt > 0);
-        assert (minNumConstsIntAsReal > 0);
-        assert (maxNumConstsIntAsReal > 0);
-        assert (minNumArrays1 > 0);
-        assert (maxNumArrays1 > 0);
-        assert (minNumArrays2 > 0);
-        assert (maxNumArrays2 > 0);
-        assert (minNumReadsArray1 > 0);
-        assert (maxNumReadsArray1 > 0);
-        assert (minNumReadsArray2 > 0);
-        assert (maxNumReadsArray2 > 0);
-        assert (minNumWritesArray1 >= 0);
-        assert (maxNumWritesArray1 >= 0);
-        assert (minNumWritesArray2 >= 0);
-        assert (maxNumWritesArray2 >= 0);
-        assert (minNumUFuncsInt >= 0);
-        assert (maxNumUFuncsInt >= 0);
-        assert (minNumUFuncsReal >= 0);
-        assert (maxNumUFuncsReal >= 0);
-        assert (minNumUFuncsArray1 >= 0);
-        assert (maxNumUFuncsArray1 >= 0);
-        assert (minNumUFuncsArray2 >= 0);
-        assert (maxNumUFuncsArray2 >= 0);
-        assert (minNumUPredsInt >= 0);
-        assert (maxNumUPredsInt >= 0);
-        assert (minNumUPredsReal >= 0);
-        assert (maxNumUPredsReal >= 0);
-        assert (minNumUPredsArray1 >= 0);
-        assert (maxNumUPredsArray1 >= 0);
-        assert (minNumUPredsArray2 >= 0);
-        assert (maxNumUPredsArray2 >= 0);
-        assert (minArgs > 0);
-        assert (maxArgs > 0);
-        assert (maxBW > 0);
-        assert (minNumQFormulasInt >= 0);
-        assert (maxNumQFormulasInt >= 0);
-        assert (minNumQFormulasReal >= 0);
-        assert (maxNumQFormulasReal >= 0);
-        assert (minNumQFormulasArray1 >= 0);
-        assert (maxNumQFormulasArray1 >= 0);
-        assert (minNumQFormulasArray2 >= 0);
-        assert (maxNumQFormulasArray2 >= 0);
-        assert (minQVars > 0);
-        assert (maxQVars > 0);
-        assert (minQNestings >= 0);
-        assert (maxQNestings >= 0);
-        checkMinMax (minNumVarsInt, maxNumVarsInt, "integer variables");
-        checkMinMax (minNumVarsReal, maxNumVarsReal, "real variables");
-        checkMinMax (minNumConstsInt, maxNumConstsInt, "integer constants");
-        checkMinMax (minNumConstsIntAsReal, maxNumConstsIntAsReal, 
-                     "integer constants in real context");
-        checkMinMax (minNumArrays1, maxNumArrays1, "arrays of type array1");
-        checkMinMax (minNumArrays2, maxNumArrays2, "arrays of type array2");
-        checkMinMax (minNumReadsArray1, maxNumReadsArray1, 
-                     "reads on arrays of type array1");
-        checkMinMax (minNumReadsArray2, maxNumReadsArray2,
-                     "reads on arrays of type array2");
-        checkMinMax (minNumWritesArray1, maxNumWritesArray1, 
-                     "writes on arrays of type array1");
-        checkMinMax (minNumWritesArray2, maxNumWritesArray2, 
-                     "writes on arrays of type array2");
-        checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
-                     "uninterpreted integer functions");
-        checkMinMax (minNumUFuncsReal, maxNumUFuncsReal, 
-                     "uninterpreted real functions");
-        checkMinMax (minNumUFuncsArray1, maxNumUFuncsArray1, 
-                     "uninterpreted array1 functions");
-        checkMinMax (minNumUFuncsArray2, maxNumUFuncsArray2, 
-                     "uninterpreted array2 functions");
-        checkMinMax (minNumUPredsInt, maxNumUPredsInt, 
-                     "uninterpreted integer predicates");
-        checkMinMax (minNumUPredsReal, maxNumUPredsReal, 
-                     "uninterpreted real predicates");
-        checkMinMax (minNumUPredsArray1, maxNumUPredsArray1, 
-                     "uninterpreted array1 predicates");
-        checkMinMax (minNumUPredsArray2, maxNumUPredsArray2, 
-                     "uninterpreted array2 predicates");
-        checkMinMax (minArgs, maxArgs, "arguments");
-        checkMinMax (minNumQFormulasInt, maxNumQFormulasInt,
-                     "quantified formulas over integers");
-        checkMinMax (minNumQFormulasReal, maxNumQFormulasReal,
-                     "quantified formulas over reals");
-        checkMinMax (minNumQFormulasArray1, maxNumQFormulasArray1,
-                     "quantified formulas over arrays of type array1");
-        checkMinMax (minNumQFormulasArray2, maxNumQFormulasArray2,
-                     "quantified formulas over arrays of type array2");
-        numVarsInt = selectRandValRange (r, minNumVarsInt, maxNumVarsInt);
-        numVarsReal = selectRandValRange (r, minNumVarsReal, maxNumVarsReal);
-        numConstsInt = selectRandValRange (r, minNumConstsInt, maxNumConstsInt);
-        numConstsIntAsReal = selectRandValRange (r, minNumConstsIntAsReal, 
-                                                 maxNumConstsIntAsReal);
-        numArrays1 = selectRandValRange (r, minNumArrays1, maxNumArrays1);
-        numArrays2 = selectRandValRange (r, minNumArrays2, maxNumArrays2);
-        numReadsArray1 = selectRandValRange (r, minNumReadsArray1, 
-                                             maxNumReadsArray1);
-        numReadsArray2 = selectRandValRange (r, minNumReadsArray2, 
-                                             maxNumReadsArray2);
-        numWritesArray1 = selectRandValRange (r, minNumWritesArray1, 
-                                              maxNumWritesArray1);
-        numWritesArray2 = selectRandValRange (r, minNumWritesArray2, 
-                                              maxNumWritesArray2);
-        numUFuncsInt = selectRandValRange (r, minNumUFuncsInt, maxNumUFuncsInt);
-        numUFuncsReal = selectRandValRange (r, minNumUFuncsReal, 
-                                            maxNumUFuncsReal);
-        numUFuncsArray1 = selectRandValRange (r, minNumUFuncsArray1, 
-                                              maxNumUFuncsArray1);
-        numUFuncsArray2 = selectRandValRange (r, minNumUFuncsArray2, 
-                                              maxNumUFuncsArray2);
-        numUPredsInt = selectRandValRange (r, minNumUPredsInt, maxNumUPredsInt);
-        numUPredsReal = selectRandValRange (r, minNumUPredsReal, 
-                                            maxNumUPredsReal);
-        numUPredsArray1 = selectRandValRange (r, minNumUPredsArray1, 
-                                              maxNumUPredsArray1);
-        numUPredsArray2 = selectRandValRange (r, minNumUPredsArray2, 
-                                              maxNumUPredsArray2);
-        numQFormulasInt = selectRandValRange (r, minNumQFormulasInt,
-                                              maxNumQFormulasInt);
-        numQFormulasReal = selectRandValRange (r, minNumQFormulasReal,
-                                               maxNumQFormulasReal);
-        numQFormulasArray1 = selectRandValRange (r, minNumQFormulasArray1,
-                                                 maxNumQFormulasArray1);
-        numQFormulasArray2 = selectRandValRange (r, minNumQFormulasArray2,
-                                                 maxNumQFormulasArray2);
-        break;
-      case QF_AUFBV:
-        assert (minNumVars > 0);
-        assert (maxNumVars > 0);
-        assert (minNumConsts > 0);
-        assert (maxNumConsts > 0);
-        assert (minNumArrays > 0);
-        assert (maxNumArrays > 0);
-        assert (minNumReads > 0);
-        assert (maxNumReads > 0);
-        assert (minNumWrites >= 0);
-        assert (maxNumWrites >= 0);
-        assert (minNumExtBool >= 0);
-        assert (maxNumExtBool >= 0);
-        assert (minBW > 0);
-        assert (maxBW > 0);
-        assert (minNumUFuncs >= 0);
-        assert (maxNumUFuncs >= 0);
-        assert (minNumUPreds >= 0);
-        assert (maxNumUPreds >= 0);
-        assert (minArgs > 0);
-        assert (maxArgs > 0);
-        checkMinMax (minNumVars, maxNumVars, "variables");
-        checkMinMax (minNumConsts, maxNumConsts, "constants");
-        checkMinMax (minNumArrays, maxNumArrays, "arrays");
-        checkMinMax (minNumReads, maxNumReads, "reads");
-        checkMinMax (minNumWrites, maxNumWrites, "writes");
-        checkMinMax (minNumExtBool, maxNumExtBool, "array equalities");
-        checkMinMax (minBW, maxBW, "bits");
-        checkMinMax (minNumUFuncs, maxNumUFuncs, "uninterpreted functions");
-        checkMinMax (minNumUPreds, maxNumUPreds, "uninterpreted predicates");
-        checkMinMax (minArgs, maxArgs, "arguments");
-        numVars = selectRandValRange (r, minNumVars, maxNumVars);
-        numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
-        numArrays = selectRandValRange (r, minNumArrays, maxNumArrays);
-        numReads = selectRandValRange (r, minNumReads, maxNumReads);
-        numWrites = selectRandValRange (r, minNumWrites, maxNumWrites);
-        numExtBool = selectRandValRange (r, minNumExtBool, maxNumExtBool);
-        numUFuncs = selectRandValRange (r, minNumUFuncs, maxNumUFuncs);
-        numUPreds = selectRandValRange (r, minNumUPreds, maxNumUPreds);
-        break;
-      case QF_UFBV:
-        assert (minNumUFuncs >= 0);
-        assert (maxNumUFuncs >= 0);
-        assert (minNumUPreds >= 0);
-        assert (maxNumUPreds >= 0);
-        assert (minArgs > 0);
-        assert (maxArgs > 0);
-        checkMinMax (minNumUFuncs, maxNumUFuncs, "uninterpreted functions");
-        checkMinMax (minNumUPreds, maxNumUPreds, "uninterpreted predicates");
-        checkMinMax (minArgs, maxArgs, "arguments");
-        numUFuncs = selectRandValRange (r, minNumUFuncs, maxNumUFuncs);
-        numUPreds = selectRandValRange (r, minNumUPreds, maxNumUPreds);
-        /* fall through by intention */
-      case QF_BV:
-        assert (minNumVars > 0);
-        assert (maxNumVars > 0);
-        assert (minNumConsts > 0);
-        assert (maxNumConsts > 0);
-        assert (minBW > 0);
-        assert (maxBW > 0);
-        checkMinMax (minNumVars, maxNumVars, "variables");
-        checkMinMax (minNumConsts, maxNumConsts, "constants");
-        numVars = selectRandValRange (r, minNumVars, maxNumVars);
-        numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
-        break;
-      case QF_LIA:
-      case QF_NIA:
-      case QF_UFLIA:
-      case QF_UFNIA:
-      case QF_LRA:
-      case QF_NRA:
-      case QF_UFLRA:
-      case QF_UFNRA:
-        assert (linear || logic != SMTLogic.QF_LIA);
-        assert (linear || logic != SMTLogic.QF_UFLIA);
-        assert (linear || logic != SMTLogic.QF_LRA);
-        assert (linear || logic != SMTLogic.QF_UFLRA);
-        assert (!linear || logic != SMTLogic.QF_NIA);
-        assert (!linear || logic != SMTLogic.QF_UFNIA);
-        assert (!linear || logic != SMTLogic.QF_NRA);
-        assert (!linear || logic != SMTLogic.QF_UFNRA);
-        /* fall through by intention */
-      case QF_IDL:
-      case QF_UFIDL:
-      case QF_RDL:
-      case QF_UFRDL:
-        assert (minNumVars > 0);
-        assert (maxNumVars > 0);
-        assert (minNumConsts > 0);
-        assert (maxNumConsts > 0);
-        assert (maxBW > 0);
-        checkMinMax (minNumVars, maxNumVars, "variables");
-        checkMinMax (minNumConsts, maxNumConsts, "constants");
-        numVars = selectRandValRange (r, minNumVars, maxNumVars);
-        numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
-        if (logic == SMTLogic.QF_UFIDL || logic == SMTLogic.QF_UFRDL ||
-            logic == SMTLogic.QF_UFLIA || logic == SMTLogic.QF_UFLRA ||
-            logic == SMTLogic.QF_UFNIA || logic == SMTLogic.QF_UFNRA) {
-          assert (minNumUFuncs >= 0);
-          assert (maxNumUFuncs >= 0);
-          assert (minNumUPreds >= 0);
-          assert (maxNumUPreds >= 0);
-          checkMinMax (minNumUFuncs, maxNumUFuncs, "uninterpreted functions");
-          checkMinMax (minNumUPreds, maxNumUPreds, "uninterpreted predicates");
-          checkMinMax (minArgs, maxArgs, "arguments");
-          numUFuncs = selectRandValRange (r, minNumUFuncs, maxNumUFuncs);
-          numUPreds = selectRandValRange (r, minNumUPreds, maxNumUPreds);
-        }
-        break;
-      case QF_UF:
-        assert (minNumVars > 0);
-        assert (maxNumVars > 0);
-        assert (minNumSorts > 0);
-        assert (maxNumSorts > 0);
-        assert (minNumUFuncs >= 0);
-        assert (minNumUPreds >= 0);
-        checkMinMax (minNumVars, maxNumVars, "variables");
-        checkMinMax (minNumSorts, maxNumSorts, "sorts");
-        checkMinMax (minArgs, maxArgs, "arguments");
-        numVars = selectRandValRange (r, minNumVars, maxNumVars);
-        numSorts = selectRandValRange (r, minNumSorts, maxNumSorts);
-        if (minNumUFuncs == 0)
-          printErrAndExit ("number of uninterpreted functions must be > 0");
-        if (minNumUPreds == 0)
-          printErrAndExit ("number of uninterpreted predicates must be > 0");
-        break;
-      case QF_A:
-      case QF_AX:
-        assert (minNumArrays > 0);
-        assert (maxNumArrays > 0);
-        assert (minNumIndices > 0);
-        assert (maxNumIndices > 0);
-        assert (minNumElements > 0);
-        assert (maxNumElements > 0);
-        assert (minNumReads > 0);
-        assert (maxNumReads > 0);
-        assert (minNumWrites >= 0);
-        assert (maxNumWrites >= 0);
-        checkMinMax (minNumArrays, maxNumArrays, "arrays");
-        checkMinMax (minNumIndices, maxNumIndices, "indices");
-        checkMinMax (minNumElements, maxNumElements, "elements");
-        checkMinMax (minNumReads, maxNumReads, "reads");
-        checkMinMax (minNumWrites, maxNumWrites, "writes");
-        numArrays = selectRandValRange (r, minNumArrays, maxNumArrays);
-        numIndices = selectRandValRange (r, minNumIndices, maxNumIndices);
-        numElements = selectRandValRange (r, minNumElements, maxNumElements);
-        numReads = selectRandValRange (r, minNumReads, maxNumReads);
-        numWrites = selectRandValRange (r, minNumWrites, maxNumWrites);
-        break;
-      case AUFLIA:
-        assert (minNumQFormulasInt >= 0);
-        assert (maxNumQFormulasInt >= 0);
-        assert (minNumQFormulasArray >= 0);
-        assert (maxNumQFormulasArray >= 0);
-        assert (minQVars > 0);
-        assert (maxQVars > 0);
-        assert (minQNestings >= 0);
-        assert (maxQNestings >= 0);
-        checkMinMax (minNumQFormulasInt, maxNumQFormulasInt,
-                     "quantified formulas over integers");
-        checkMinMax (minNumQFormulasArray, maxNumQFormulasArray,
-                     "quantified formulas over arrays");
-        numQFormulasInt = selectRandValRange (r, minNumQFormulasInt,
-                                              maxNumQFormulasInt);
-        numQFormulasArray = selectRandValRange (r, minNumQFormulasArray,
-                                                maxNumQFormulasArray);
-        /* fall through by intention */
-      case QF_AUFLIA:
-        assert (minNumVars > 0);
-        assert (maxNumVars > 0);
-        assert (minNumConsts > 0);
-        assert (maxNumConsts > 0);
-        assert (minNumArrays > 0);
-        assert (maxNumArrays > 0);
-        assert (minNumReads > 0);
-        assert (maxNumReads > 0);
-        assert (minNumWrites >= 0);
-        assert (maxNumWrites >= 0);
-        assert (minNumUFuncsInt >= 0);
-        assert (maxNumUFuncsInt >= 0);
-        assert (minNumUFuncsArray >= 0);
-        assert (maxNumUFuncsArray >= 0);
-        assert (minNumUPredsInt >= 0);
-        assert (maxNumUPredsInt >= 0);
-        assert (minNumUPredsArray >= 0);
-        assert (maxNumUPredsArray >= 0);
-        assert (minArgs > 0);
-        assert (maxArgs > 0);
-        assert (maxBW > 0);
-        assert (linear);
-        checkMinMax (minNumVars, maxNumVars, "variables");
-        checkMinMax (minNumConsts, maxNumConsts, "constants");
-        checkMinMax (minNumArrays, maxNumArrays, "arrays");
-        checkMinMax (minNumReads, maxNumReads, "reads");
-        checkMinMax (minNumWrites, maxNumWrites, "writes");
-        checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
-                     "uninterpreted int functions");
-        checkMinMax (minNumUFuncsArray, maxNumUFuncsArray, 
-                     "uninterpreted array functions");
-        checkMinMax (minNumUPredsInt, maxNumUPredsInt, 
-                     "uninterpreted int predicates");
-        checkMinMax (minNumUPredsArray, maxNumUPredsArray, 
-                     "uninterpreted array predicates");
-        checkMinMax (minArgs, maxArgs, "arguments");
-        numVars = selectRandValRange (r, minNumVars, maxNumVars);
-        numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
-        numArrays = selectRandValRange (r, minNumArrays, maxNumArrays);
-        numReads = selectRandValRange (r, minNumReads, maxNumReads);
-        numWrites = selectRandValRange (r, minNumWrites, maxNumWrites);
-        numUFuncsInt = selectRandValRange (r, minNumUFuncsInt, maxNumUFuncsInt);
-        numUFuncsArray = selectRandValRange (r, minNumUFuncsArray, 
-                                             maxNumUFuncsArray);
-        numUPredsInt = selectRandValRange (r, minNumUPredsInt, maxNumUPredsInt);
-        numUPredsArray = selectRandValRange (r, minNumUPredsArray, 
-                                             maxNumUPredsArray);
-        break;
-      case QF_UFLIA_SETS:
-        assert (minNumVars > 0);
-        assert (maxNumVars > 0);
-        assert (minNumConsts > 0);
-        assert (maxNumConsts > 0);
-        assert (minNumSets > 0);
-        assert (maxNumSets > 0);
-        assert (minNumMembers >= 0);
-        assert (maxNumMembers > 0);
-        assert (minNumUFuncsInt >= 0);
-        assert (maxNumUFuncsInt >= 0);
-        assert (minNumUFuncsSets >= 0);
-        assert (maxNumUFuncsSets >= 0);
-        assert (minNumUPredsInt >= 0);
-        assert (maxNumUPredsInt >= 0);
-        assert (minNumUPredsSets >= 0);
-        assert (maxNumUPredsSets >= 0);
-        assert (minArgs > 0);
-        assert (maxArgs > 0);
-        assert (maxBW > 0);
-        assert (linear);
-        checkMinMax (minNumVars, maxNumVars, "variables");
-        checkMinMax (minNumConsts, maxNumConsts, "constants");
-        checkMinMax (minNumSets, maxNumSets, "sets");
-        checkMinMax (minNumMembers, maxNumMembers, "members");
-        checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
-                     "uninterpreted int functions");
-        checkMinMax (minNumUFuncsArray, maxNumUFuncsArray, 
-                     "uninterpreted set functions");
-        checkMinMax (minNumUPredsInt, maxNumUPredsInt, 
-                     "uninterpreted int predicates");
-        checkMinMax (minNumUPredsArray, maxNumUPredsArray, 
-                     "uninterpreted set predicates");
-        checkMinMax (minArgs, maxArgs, "arguments");
-        numVars = selectRandValRange (r, minNumVars, maxNumVars);
-        numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
-        numSets = selectRandValRange (r, minNumSets, maxNumSets);
-        numMembers = selectRandValRange (r, minNumMembers, maxNumMembers);
-        numUFuncsInt = selectRandValRange (r, minNumUFuncsInt, maxNumUFuncsInt);
-        numUFuncsSets = selectRandValRange (r, minNumUFuncsSets, 
-                                             maxNumUFuncsSets);
-        numUPredsInt = selectRandValRange (r, minNumUPredsInt, maxNumUPredsInt);
-        numUPredsSets = selectRandValRange (r, minNumUPredsSets, 
-                                             maxNumUPredsSets);
-        break;
+		case AUFLIRA:
+		case AUFNIRA:
+			assert (linear || logic != SMTLogic.AUFLIRA);
+			assert (!linear || logic != SMTLogic.AUFNIRA);
+			assert (minNumVarsInt > 0);
+			assert (maxNumVarsInt > 0);
+			assert (minNumVarsReal > 0);
+			assert (maxNumVarsReal > 0);
+			assert (minNumConstsInt > 0);
+			assert (maxNumConstsInt > 0);
+			assert (minNumConstsIntAsReal > 0);
+			assert (maxNumConstsIntAsReal > 0);
+			assert (minNumArrays1 > 0);
+			assert (maxNumArrays1 > 0);
+			assert (minNumArrays2 > 0);
+			assert (maxNumArrays2 > 0);
+			assert (minNumReadsArray1 > 0);
+			assert (maxNumReadsArray1 > 0);
+			assert (minNumReadsArray2 > 0);
+			assert (maxNumReadsArray2 > 0);
+			assert (minNumWritesArray1 >= 0);
+			assert (maxNumWritesArray1 >= 0);
+			assert (minNumWritesArray2 >= 0);
+			assert (maxNumWritesArray2 >= 0);
+			assert (minNumUFuncsInt >= 0);
+			assert (maxNumUFuncsInt >= 0);
+			assert (minNumUFuncsReal >= 0);
+			assert (maxNumUFuncsReal >= 0);
+			assert (minNumUFuncsArray1 >= 0);
+			assert (maxNumUFuncsArray1 >= 0);
+			assert (minNumUFuncsArray2 >= 0);
+			assert (maxNumUFuncsArray2 >= 0);
+			assert (minNumUPredsInt >= 0);
+			assert (maxNumUPredsInt >= 0);
+			assert (minNumUPredsReal >= 0);
+			assert (maxNumUPredsReal >= 0);
+			assert (minNumUPredsArray1 >= 0);
+			assert (maxNumUPredsArray1 >= 0);
+			assert (minNumUPredsArray2 >= 0);
+			assert (maxNumUPredsArray2 >= 0);
+			assert (minArgs > 0);
+			assert (maxArgs > 0);
+			assert (maxBW > 0);
+			assert (minNumQFormulasInt >= 0);
+			assert (maxNumQFormulasInt >= 0);
+			assert (minNumQFormulasReal >= 0);
+			assert (maxNumQFormulasReal >= 0);
+			assert (minNumQFormulasArray1 >= 0);
+			assert (maxNumQFormulasArray1 >= 0);
+			assert (minNumQFormulasArray2 >= 0);
+			assert (maxNumQFormulasArray2 >= 0);
+			assert (minQVars > 0);
+			assert (maxQVars > 0);
+			assert (minQNestings >= 0);
+			assert (maxQNestings >= 0);
+			checkMinMax (minNumVarsInt, maxNumVarsInt, "integer variables");
+			checkMinMax (minNumVarsReal, maxNumVarsReal, "real variables");
+			checkMinMax (minNumConstsInt, maxNumConstsInt, "integer constants");
+			checkMinMax (minNumConstsIntAsReal, maxNumConstsIntAsReal, 
+									 "integer constants in real context");
+			checkMinMax (minNumArrays1, maxNumArrays1, "arrays of type array1");
+			checkMinMax (minNumArrays2, maxNumArrays2, "arrays of type array2");
+			checkMinMax (minNumReadsArray1, maxNumReadsArray1, 
+									 "reads on arrays of type array1");
+			checkMinMax (minNumReadsArray2, maxNumReadsArray2,
+									 "reads on arrays of type array2");
+			checkMinMax (minNumWritesArray1, maxNumWritesArray1, 
+									 "writes on arrays of type array1");
+			checkMinMax (minNumWritesArray2, maxNumWritesArray2, 
+									 "writes on arrays of type array2");
+			checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
+									 "uninterpreted integer functions");
+			checkMinMax (minNumUFuncsReal, maxNumUFuncsReal, 
+									 "uninterpreted real functions");
+			checkMinMax (minNumUFuncsArray1, maxNumUFuncsArray1, 
+									 "uninterpreted array1 functions");
+			checkMinMax (minNumUFuncsArray2, maxNumUFuncsArray2, 
+									 "uninterpreted array2 functions");
+			checkMinMax (minNumUPredsInt, maxNumUPredsInt, 
+									 "uninterpreted integer predicates");
+			checkMinMax (minNumUPredsReal, maxNumUPredsReal, 
+									 "uninterpreted real predicates");
+			checkMinMax (minNumUPredsArray1, maxNumUPredsArray1, 
+									 "uninterpreted array1 predicates");
+			checkMinMax (minNumUPredsArray2, maxNumUPredsArray2, 
+									 "uninterpreted array2 predicates");
+			checkMinMax (minArgs, maxArgs, "arguments");
+			checkMinMax (minNumQFormulasInt, maxNumQFormulasInt,
+									 "quantified formulas over integers");
+			checkMinMax (minNumQFormulasReal, maxNumQFormulasReal,
+									 "quantified formulas over reals");
+			checkMinMax (minNumQFormulasArray1, maxNumQFormulasArray1,
+									 "quantified formulas over arrays of type array1");
+			checkMinMax (minNumQFormulasArray2, maxNumQFormulasArray2,
+									 "quantified formulas over arrays of type array2");
+			numVarsInt = selectRandValRange (r, minNumVarsInt, maxNumVarsInt);
+			numVarsReal = selectRandValRange (r, minNumVarsReal, maxNumVarsReal);
+			numConstsInt = selectRandValRange (r, minNumConstsInt, maxNumConstsInt);
+			numConstsIntAsReal = selectRandValRange (r, minNumConstsIntAsReal, 
+																							 maxNumConstsIntAsReal);
+			numArrays1 = selectRandValRange (r, minNumArrays1, maxNumArrays1);
+			numArrays2 = selectRandValRange (r, minNumArrays2, maxNumArrays2);
+			numReadsArray1 = selectRandValRange (r, minNumReadsArray1, 
+																					 maxNumReadsArray1);
+			numReadsArray2 = selectRandValRange (r, minNumReadsArray2, 
+																					 maxNumReadsArray2);
+			numWritesArray1 = selectRandValRange (r, minNumWritesArray1, 
+																						maxNumWritesArray1);
+			numWritesArray2 = selectRandValRange (r, minNumWritesArray2, 
+																						maxNumWritesArray2);
+			numUFuncsInt = selectRandValRange (r, minNumUFuncsInt, maxNumUFuncsInt);
+			numUFuncsReal = selectRandValRange (r, minNumUFuncsReal, 
+																					maxNumUFuncsReal);
+			numUFuncsArray1 = selectRandValRange (r, minNumUFuncsArray1, 
+																						maxNumUFuncsArray1);
+			numUFuncsArray2 = selectRandValRange (r, minNumUFuncsArray2, 
+																						maxNumUFuncsArray2);
+			numUPredsInt = selectRandValRange (r, minNumUPredsInt, maxNumUPredsInt);
+			numUPredsReal = selectRandValRange (r, minNumUPredsReal, 
+																					maxNumUPredsReal);
+			numUPredsArray1 = selectRandValRange (r, minNumUPredsArray1, 
+																						maxNumUPredsArray1);
+			numUPredsArray2 = selectRandValRange (r, minNumUPredsArray2, 
+																						maxNumUPredsArray2);
+			numQFormulasInt = selectRandValRange (r, minNumQFormulasInt,
+																						maxNumQFormulasInt);
+			numQFormulasReal = selectRandValRange (r, minNumQFormulasReal,
+																						 maxNumQFormulasReal);
+			numQFormulasArray1 = selectRandValRange (r, minNumQFormulasArray1,
+																							 maxNumQFormulasArray1);
+			numQFormulasArray2 = selectRandValRange (r, minNumQFormulasArray2,
+																							 maxNumQFormulasArray2);
+			break;
+		case QF_AUFBV:
+			assert (minNumVars > 0);
+			assert (maxNumVars > 0);
+			assert (minNumConsts > 0);
+			assert (maxNumConsts > 0);
+			assert (minNumArrays > 0);
+			assert (maxNumArrays > 0);
+			assert (minNumReads > 0);
+			assert (maxNumReads > 0);
+			assert (minNumWrites >= 0);
+			assert (maxNumWrites >= 0);
+			assert (minNumExtBool >= 0);
+			assert (maxNumExtBool >= 0);
+			assert (minBW > 0);
+			assert (maxBW > 0);
+			assert (minNumUFuncs >= 0);
+			assert (maxNumUFuncs >= 0);
+			assert (minNumUPreds >= 0);
+			assert (maxNumUPreds >= 0);
+			assert (minArgs > 0);
+			assert (maxArgs > 0);
+			checkMinMax (minNumVars, maxNumVars, "variables");
+			checkMinMax (minNumConsts, maxNumConsts, "constants");
+			checkMinMax (minNumArrays, maxNumArrays, "arrays");
+			checkMinMax (minNumReads, maxNumReads, "reads");
+			checkMinMax (minNumWrites, maxNumWrites, "writes");
+			checkMinMax (minNumExtBool, maxNumExtBool, "array equalities");
+			checkMinMax (minBW, maxBW, "bits");
+			checkMinMax (minNumUFuncs, maxNumUFuncs, "uninterpreted functions");
+			checkMinMax (minNumUPreds, maxNumUPreds, "uninterpreted predicates");
+			checkMinMax (minArgs, maxArgs, "arguments");
+			numVars = selectRandValRange (r, minNumVars, maxNumVars);
+			numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
+			numArrays = selectRandValRange (r, minNumArrays, maxNumArrays);
+			numReads = selectRandValRange (r, minNumReads, maxNumReads);
+			numWrites = selectRandValRange (r, minNumWrites, maxNumWrites);
+			numExtBool = selectRandValRange (r, minNumExtBool, maxNumExtBool);
+			numUFuncs = selectRandValRange (r, minNumUFuncs, maxNumUFuncs);
+			numUPreds = selectRandValRange (r, minNumUPreds, maxNumUPreds);
+			break;
+		case QF_UFBV:
+			assert (minNumUFuncs >= 0);
+			assert (maxNumUFuncs >= 0);
+			assert (minNumUPreds >= 0);
+			assert (maxNumUPreds >= 0);
+			assert (minArgs > 0);
+			assert (maxArgs > 0);
+			checkMinMax (minNumUFuncs, maxNumUFuncs, "uninterpreted functions");
+			checkMinMax (minNumUPreds, maxNumUPreds, "uninterpreted predicates");
+			checkMinMax (minArgs, maxArgs, "arguments");
+			numUFuncs = selectRandValRange (r, minNumUFuncs, maxNumUFuncs);
+			numUPreds = selectRandValRange (r, minNumUPreds, maxNumUPreds);
+			/* fall through by intention */
+		case QF_BV:
+			assert (minNumVars > 0);
+			assert (maxNumVars > 0);
+			assert (minNumConsts > 0);
+			assert (maxNumConsts > 0);
+			assert (minBW > 0);
+			assert (maxBW > 0);
+			checkMinMax (minNumVars, maxNumVars, "variables");
+			checkMinMax (minNumConsts, maxNumConsts, "constants");
+			numVars = selectRandValRange (r, minNumVars, maxNumVars);
+			numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
+			break;
+		case QF_LIA:
+		case QF_NIA:
+		case QF_UFLIA:
+		case QF_UFNIA:
+		case QF_LRA:
+		case QF_NRA:
+		case QF_UFLRA:
+		case QF_UFNRA:
+			assert (linear || logic != SMTLogic.QF_LIA);
+			assert (linear || logic != SMTLogic.QF_UFLIA);
+			assert (linear || logic != SMTLogic.QF_LRA);
+			assert (linear || logic != SMTLogic.QF_UFLRA);
+			assert (!linear || logic != SMTLogic.QF_NIA);
+			assert (!linear || logic != SMTLogic.QF_UFNIA);
+			assert (!linear || logic != SMTLogic.QF_NRA);
+			assert (!linear || logic != SMTLogic.QF_UFNRA);
+			/* fall through by intention */
+		case QF_IDL:
+		case QF_UFIDL:
+		case QF_RDL:
+		case QF_UFRDL:
+			assert (minNumVars > 0);
+			assert (maxNumVars > 0);
+			assert (minNumConsts > 0);
+			assert (maxNumConsts > 0);
+			assert (maxBW > 0);
+			checkMinMax (minNumVars, maxNumVars, "variables");
+			checkMinMax (minNumConsts, maxNumConsts, "constants");
+			numVars = selectRandValRange (r, minNumVars, maxNumVars);
+			numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
+			if (logic == SMTLogic.QF_UFIDL || logic == SMTLogic.QF_UFRDL ||
+					logic == SMTLogic.QF_UFLIA || logic == SMTLogic.QF_UFLRA ||
+					logic == SMTLogic.QF_UFNIA || logic == SMTLogic.QF_UFNRA) {
+				assert (minNumUFuncs >= 0);
+				assert (maxNumUFuncs >= 0);
+				assert (minNumUPreds >= 0);
+				assert (maxNumUPreds >= 0);
+				checkMinMax (minNumUFuncs, maxNumUFuncs, "uninterpreted functions");
+				checkMinMax (minNumUPreds, maxNumUPreds, "uninterpreted predicates");
+				checkMinMax (minArgs, maxArgs, "arguments");
+				numUFuncs = selectRandValRange (r, minNumUFuncs, maxNumUFuncs);
+				numUPreds = selectRandValRange (r, minNumUPreds, maxNumUPreds);
+			}
+			break;
+		case QF_UF:
+			assert (minNumVars > 0);
+			assert (maxNumVars > 0);
+			assert (minNumSorts > 0);
+			assert (maxNumSorts > 0);
+			assert (minNumUFuncs >= 0);
+			assert (minNumUPreds >= 0);
+			checkMinMax (minNumVars, maxNumVars, "variables");
+			checkMinMax (minNumSorts, maxNumSorts, "sorts");
+			checkMinMax (minArgs, maxArgs, "arguments");
+			numVars = selectRandValRange (r, minNumVars, maxNumVars);
+			numSorts = selectRandValRange (r, minNumSorts, maxNumSorts);
+			if (minNumUFuncs == 0)
+				printErrAndExit ("number of uninterpreted functions must be > 0");
+			if (minNumUPreds == 0)
+				printErrAndExit ("number of uninterpreted predicates must be > 0");
+			break;
+		case QF_A:
+		case QF_AX:
+			assert (minNumArrays > 0);
+			assert (maxNumArrays > 0);
+			assert (minNumIndices > 0);
+			assert (maxNumIndices > 0);
+			assert (minNumElements > 0);
+			assert (maxNumElements > 0);
+			assert (minNumReads > 0);
+			assert (maxNumReads > 0);
+			assert (minNumWrites >= 0);
+			assert (maxNumWrites >= 0);
+			checkMinMax (minNumArrays, maxNumArrays, "arrays");
+			checkMinMax (minNumIndices, maxNumIndices, "indices");
+			checkMinMax (minNumElements, maxNumElements, "elements");
+			checkMinMax (minNumReads, maxNumReads, "reads");
+			checkMinMax (minNumWrites, maxNumWrites, "writes");
+			numArrays = selectRandValRange (r, minNumArrays, maxNumArrays);
+			numIndices = selectRandValRange (r, minNumIndices, maxNumIndices);
+			numElements = selectRandValRange (r, minNumElements, maxNumElements);
+			numReads = selectRandValRange (r, minNumReads, maxNumReads);
+			numWrites = selectRandValRange (r, minNumWrites, maxNumWrites);
+			break;
+		case AUFLIA:
+			assert (minNumQFormulasInt >= 0);
+			assert (maxNumQFormulasInt >= 0);
+			assert (minNumQFormulasArray >= 0);
+			assert (maxNumQFormulasArray >= 0);
+			assert (minQVars > 0);
+			assert (maxQVars > 0);
+			assert (minQNestings >= 0);
+			assert (maxQNestings >= 0);
+			checkMinMax (minNumQFormulasInt, maxNumQFormulasInt,
+									 "quantified formulas over integers");
+			checkMinMax (minNumQFormulasArray, maxNumQFormulasArray,
+									 "quantified formulas over arrays");
+			numQFormulasInt = selectRandValRange (r, minNumQFormulasInt,
+																						maxNumQFormulasInt);
+			numQFormulasArray = selectRandValRange (r, minNumQFormulasArray,
+																							maxNumQFormulasArray);
+			/* fall through by intention */
+		case QF_AUFLIA:
+			assert (minNumVars > 0);
+			assert (maxNumVars > 0);
+			assert (minNumConsts > 0);
+			assert (maxNumConsts > 0);
+			assert (minNumArrays > 0);
+			assert (maxNumArrays > 0);
+			assert (minNumReads > 0);
+			assert (maxNumReads > 0);
+			assert (minNumWrites >= 0);
+			assert (maxNumWrites >= 0);
+			assert (minNumUFuncsInt >= 0);
+			assert (maxNumUFuncsInt >= 0);
+			assert (minNumUFuncsArray >= 0);
+			assert (maxNumUFuncsArray >= 0);
+			assert (minNumUPredsInt >= 0);
+			assert (maxNumUPredsInt >= 0);
+			assert (minNumUPredsArray >= 0);
+			assert (maxNumUPredsArray >= 0);
+			assert (minArgs > 0);
+			assert (maxArgs > 0);
+			assert (maxBW > 0);
+			assert (linear);
+			checkMinMax (minNumVars, maxNumVars, "variables");
+			checkMinMax (minNumConsts, maxNumConsts, "constants");
+			checkMinMax (minNumArrays, maxNumArrays, "arrays");
+			checkMinMax (minNumReads, maxNumReads, "reads");
+			checkMinMax (minNumWrites, maxNumWrites, "writes");
+			checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
+									 "uninterpreted int functions");
+			checkMinMax (minNumUFuncsArray, maxNumUFuncsArray, 
+									 "uninterpreted array functions");
+			checkMinMax (minNumUPredsInt, maxNumUPredsInt, 
+									 "uninterpreted int predicates");
+			checkMinMax (minNumUPredsArray, maxNumUPredsArray, 
+									 "uninterpreted array predicates");
+			checkMinMax (minArgs, maxArgs, "arguments");
+			numVars = selectRandValRange (r, minNumVars, maxNumVars);
+			numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
+			numArrays = selectRandValRange (r, minNumArrays, maxNumArrays);
+			numReads = selectRandValRange (r, minNumReads, maxNumReads);
+			numWrites = selectRandValRange (r, minNumWrites, maxNumWrites);
+			numUFuncsInt = selectRandValRange (r, minNumUFuncsInt, maxNumUFuncsInt);
+			numUFuncsArray = selectRandValRange (r, minNumUFuncsArray, 
+																					 maxNumUFuncsArray);
+			numUPredsInt = selectRandValRange (r, minNumUPredsInt, maxNumUPredsInt);
+			numUPredsArray = selectRandValRange (r, minNumUPredsArray, 
+																					 maxNumUPredsArray);
+			break;
+		case QF_UFLIA_SETS:
+			assert (minNumVars > 0);
+			assert (maxNumVars > 0);
+			assert (minNumConsts > 0);
+			assert (maxNumConsts > 0);
+			assert (minNumSets > 0);
+			assert (maxNumSets > 0);
+			assert (minNumMembers >= 0);
+			assert (maxNumMembers > 0);
+			assert (minNumUFuncsInt >= 0);
+			assert (maxNumUFuncsInt >= 0);
+			assert (minNumUFuncsSets >= 0);
+			assert (maxNumUFuncsSets >= 0);
+			assert (minNumUPredsInt >= 0);
+			assert (maxNumUPredsInt >= 0);
+			assert (minNumUPredsSets >= 0);
+			assert (maxNumUPredsSets >= 0);
+			assert (minArgs > 0);
+			assert (maxArgs > 0);
+			assert (maxBW > 0);
+			assert (linear);
+			checkMinMax (minNumVars, maxNumVars, "variables");
+			checkMinMax (minNumConsts, maxNumConsts, "constants");
+			checkMinMax (minNumSets, maxNumSets, "sets");
+			checkMinMax (minNumMembers, maxNumMembers, "members");
+			checkMinMax (minNumUFuncsInt, maxNumUFuncsInt, 
+									 "uninterpreted int functions");
+			checkMinMax (minNumUFuncsArray, maxNumUFuncsArray, 
+									 "uninterpreted set functions");
+			checkMinMax (minNumUPredsInt, maxNumUPredsInt, 
+									 "uninterpreted int predicates");
+			checkMinMax (minNumUPredsArray, maxNumUPredsArray, 
+									 "uninterpreted set predicates");
+			checkMinMax (minArgs, maxArgs, "arguments");
+			numVars = selectRandValRange (r, minNumVars, maxNumVars);
+			numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
+			numSets = selectRandValRange (r, minNumSets, maxNumSets);
+			numMembers = selectRandValRange (r, minNumMembers, maxNumMembers);
+			numUFuncsInt = selectRandValRange (r, minNumUFuncsInt, maxNumUFuncsInt);
+			numUFuncsSets = selectRandValRange (r, minNumUFuncsSets, 
+																					maxNumUFuncsSets);
+			numUPredsInt = selectRandValRange (r, minNumUPredsInt, maxNumUPredsInt);
+			numUPredsSets = selectRandValRange (r, minNumUPredsSets, 
+																					maxNumUPredsSets);
+			break;
+		case QF_FP:
+			assert (minNumVars > 0);
+			assert (maxNumVars > 0);
+			assert (minNumConsts > 0);
+			assert (maxNumConsts > 0);
+      
+      checkMinMax (minNumVars, maxNumVars, "variables");
+			checkMinMax (minNumConsts, maxNumConsts, "constants");
+      checkRange (numRoundingModesRange, "rounding modes", 1);
+      checkRange (expBitsRange, "exponent bits", 2);
+      checkRange (sigBitsRange, "significand bits", 2);
+      
 
+			numVars = selectRandValRange (r, minNumVars, maxNumVars);
+			numConsts = selectRandValRange (r, minNumConsts, maxNumConsts);
+      numRoundingModes = numRoundingModesRange.selectRandom(r);
+      
+			break;
     }
     
 
     boolNodes = new ArrayList<SMTNode>();
     assert (r != null);
     assert (logic != null);
-    System.out.print ("(set-info :source |fuzzsmt|)\n");
+    System.out.print ("(set-info :source |fuzzsmt(seed="+seed+")|)\n");
     System.out.print ("(set-info :smt-lib-version 2.0)\n");
     System.out.print ("(set-info :category \"random\")\n");
     System.out.print ("(set-info :status unknown)\n");
     System.out.print ("(set-logic " + logic.toString() + ")\n");
     switch (logic) {
-      case QF_BV:
-      case QF_UFBV:{
-        ArrayList<SMTNode> bvNodes = new ArrayList<SMTNode>();
-        ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
-        ArrayList<UPred> uPreds = new ArrayList<UPred>();
-        BVDivGuards = new HashMap<SMTNode, SMTNodeKind>();
-        generateUFuncsBV (r, uFuncs, numUFuncs, minArgs, maxArgs, minBW, maxBW);
-        generateUPredsBV (r, uPreds, numUPreds, minArgs, maxArgs, minBW, maxBW);
-        generateBVVars (r, bvNodes, numVars, minBW, maxBW);
-        System.out.print ("(assert ");
-        pars += generateBVConsts (r, bvNodes, numConsts, minBW, maxBW); 
-        pars += generateBVLayer (r, bvNodes, minRefs, minBW, maxBW, bvDivMode,
-                                 BVDivGuards, false, uFuncs, uPreds);
-        pars += generateBVPredicateLayer (r, bvNodes, boolNodes, minRefs,
-                                          uPreds);
-      }
+		case QF_FP:{
+			ArrayList<SMTNode> fpNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> roundingModes = new ArrayList<SMTNode>();
+
+			generateFPVars (r, fpNodes, numVars, expBitsRange, sigBitsRange);
+			System.out.print ("(assert ");
+			pars += generateFPRoundingModes (r, roundingModes, numRoundingModes);
+			pars += generateFPConsts (r, fpNodes, numConsts, expBitsRange, sigBitsRange);
+			pars += generateFPLayer (r, fpNodes, roundingModes, false, minRefs, expBitsRange, sigBitsRange);
+      pars += generateFPComparisons (r, fpNodes, boolNodes, roundingModes, minRefs, expBitsRange, sigBitsRange);
+
+			// TODO add ITEs for rounding modes, floating points, booleans
+			// TODO repeat generating more expressions once ITEs are fixed
+		}
       break;
-      case QF_AUFBV: {
-        int numExtBV = 0;
-        ArrayList<SMTNode> sorts = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> bvNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> arrayNodes = new ArrayList<SMTNode>();
-        ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
-        ArrayList<UPred> uPreds = new ArrayList<UPred>();
-        BVDivGuards = new HashMap<SMTNode, SMTNodeKind>();
-        generateUFuncsBV (r, uFuncs, numUFuncs, minArgs, maxArgs, minBW, maxBW);
-        generateUPredsBV (r, uPreds, numUPreds, minArgs, maxArgs, minBW, maxBW);
-        generateBVVars (r, bvNodes, numVars, minBW, maxBW);
-        generateBVArrayVars (r, arrayNodes, numArrays, minBW, maxBW);
-        System.out.print ("(assert ");
 
-        /* half of extensional array equalities are encoded intot bit-vector, 
-         * the other half into the boolean part */
-        if (numExtBool > 0) {
-          numExtBV = (numExtBool >>> 1) + (numExtBool & 1);
-          numExtBool >>>= 1;
-        }
-
-        pars += generateBVConsts (r, bvNodes, numConsts, minBW, maxBW); 
-        pars += generateBVLayer (r, bvNodes, minRefs, minBW, maxBW, bvDivMode,
-                                 BVDivGuards, true, uFuncs, uPreds);
-        /* interleave creation of layers to ensure that
-         * numReads are also used as read indices, numWrites indices 
-         * and write values.
-         * Moreover, equalities between numArrays are encoded as bit-vectors
-         * and integrated into the bit-vector layer. Therefore, they
-         * may also contribute to read indices, write indices and write values.
-         */
-        while (numWrites > 0 || numReads > 0 || numExtBV > 0) {
-          pars += generateBVWriteLayer (r, arrayNodes, bvNodes, 
-                                        (numWrites >>> 1) + (numWrites & 1));
-          pars += generateBVArrayExtBVLayer (r, arrayNodes, bvNodes, 
-                                             (numExtBV >>> 1) + (numExtBV & 1));
-          pars += generateBVReadLayer (r, arrayNodes, bvNodes, 
-                                       (numReads >>> 1) + (numReads & 1));
-          numWrites >>>= 1;
-          numExtBV >>>= 1;
-          numReads >>>= 1;
-        }
-        assert (numWrites == 0);
-        assert (numReads == 0);
-        assert (numExtBV == 0);
-        /* create additional bit-vector layer on top to ensure
-         * that numReads and equalities between numArrays are also used as
-         * inputs for bit-vector operations.
-         */
-        pars += generateBVLayer (r, bvNodes, minRefs, minBW, maxBW, bvDivMode,
-                                 BVDivGuards, true, uFuncs, uPreds);
-        pars += generateBVPredicateLayer (r, bvNodes, boolNodes, minRefs,
-                                          uPreds);
-        pars += addArrayExt (r, arrayNodes, boolNodes, numExtBool);
-      }
+		case QF_BV:
+		case QF_UFBV:{
+			ArrayList<SMTNode> bvNodes = new ArrayList<SMTNode>();
+			ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
+			ArrayList<UPred> uPreds = new ArrayList<UPred>();
+			BVDivGuards = new HashMap<SMTNode, SMTNodeKind>();
+			generateUFuncsBV (r, uFuncs, numUFuncs, minArgs, maxArgs, minBW, maxBW);
+			generateUPredsBV (r, uPreds, numUPreds, minArgs, maxArgs, minBW, maxBW);
+			generateBVVars (r, bvNodes, numVars, minBW, maxBW);
+			System.out.print ("(assert ");
+			pars += generateBVConsts (r, bvNodes, numConsts, minBW, maxBW); 
+			pars += generateBVLayer (r, bvNodes, minRefs, minBW, maxBW, bvDivMode,
+															 BVDivGuards, false, uFuncs, uPreds);
+			pars += generateBVPredicateLayer (r, bvNodes, boolNodes, minRefs,
+																				uPreds);
+		}
       break;
-      case QF_A: 
-      case QF_AX: {
-        int numWritesH, numReadsH;
-        SMTType arrayType = ArrayType.arrayType; 
-        SMTType indexType = new UType ("Index");
-        SMTType elementType = new UType ("Element");
-	System.out.print("(declare-sort Index 0)\n");
-	System.out.print("(declare-sort Element 0)\n");
-        ArrayList<SMTNode> arrays = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> indices = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> elements = new ArrayList<SMTNode>();
-        generateVarsOfOneType (arrays, numArrays, arrayType);
-        generateVarsOfOneType (indices, numIndices, indexType);
-        generateVarsOfOneType (elements, numElements, elementType);
-        System.out.print ("(assert ");
-        numWritesH = (numWrites >>> 1) + (numWrites & 1);
-        numReadsH = (numReads >>> 1) + (numReads & 1);
-        numWrites >>>= 1;
-        numReads >>>= 1;
-        while (numWrites > 0 || numReads > 0) {
-          pars += generateWriteLayer (r, arrays, indices, elements, arrayType,
-                                      (numWrites >>> 1) + (numWrites & 1));
-          pars += generateReadLayer (r, arrays, indices, elements, elementType,
-                                     (numReads >>> 1) + (numReads & 1));
-          numWrites >>>= 1;
-          numReads >>>= 1;
-        }
-        if (logic == SMTLogic.QF_AX)
-          pars += generateComparisonLayer (r, arrays, boolNodes, null, minRefs,
-                                           RelCompMode.EQ, false);
-        pars += generateComparisonLayer (r, indices, boolNodes, null, minRefs, 
-                                         RelCompMode.EQ, false);
-        pars += generateComparisonLayer (r, elements, boolNodes, null, minRefs, 
-                                         RelCompMode.EQ, false);
-        /* generate ITE Layer */
-        pars += generateITELayer (r, arrays, boolNodes, minRefs);
-        pars += generateITELayer (r, indices, boolNodes, minRefs);
-        pars += generateITELayer (r, elements, boolNodes, minRefs);
-        /* generate second write and read layer */
-        while (numWritesH > 0 || numReadsH > 0) {
-          pars += generateWriteLayer (r, arrays, indices, elements, arrayType, 
-                                      (numWritesH >>> 1) + (numWritesH & 1));
-          pars += generateReadLayer (r, arrays, indices, elements, elementType,
-                                     (numReadsH >>> 1) + (numReadsH & 1));
-          numWritesH >>>= 1;
-          numReadsH >>>= 1;
-        }
-        if (logic == SMTLogic.QF_AX)
-          pars += generateComparisonLayer (r, arrays, boolNodes, null, minRefs, 
-                                           RelCompMode.EQ, false);
-        pars += generateComparisonLayer (r, indices, boolNodes, null, minRefs, 
-                                         RelCompMode.EQ, false);
-        pars += generateComparisonLayer (r, elements, boolNodes, null, minRefs, 
-                                         RelCompMode.EQ, false);
-      }
+		case QF_AUFBV: {
+			int numExtBV = 0;
+			ArrayList<SMTNode> sorts = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> bvNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> arrayNodes = new ArrayList<SMTNode>();
+			ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
+			ArrayList<UPred> uPreds = new ArrayList<UPred>();
+			BVDivGuards = new HashMap<SMTNode, SMTNodeKind>();
+			generateUFuncsBV (r, uFuncs, numUFuncs, minArgs, maxArgs, minBW, maxBW);
+			generateUPredsBV (r, uPreds, numUPreds, minArgs, maxArgs, minBW, maxBW);
+			generateBVVars (r, bvNodes, numVars, minBW, maxBW);
+			generateBVArrayVars (r, arrayNodes, numArrays, minBW, maxBW);
+			System.out.print ("(assert ");
+
+			/* half of extensional array equalities are encoded intot bit-vector, 
+			 * the other half into the boolean part */
+			if (numExtBool > 0) {
+				numExtBV = (numExtBool >>> 1) + (numExtBool & 1);
+				numExtBool >>>= 1;
+			}
+
+			pars += generateBVConsts (r, bvNodes, numConsts, minBW, maxBW); 
+			pars += generateBVLayer (r, bvNodes, minRefs, minBW, maxBW, bvDivMode,
+															 BVDivGuards, true, uFuncs, uPreds);
+			/* interleave creation of layers to ensure that
+			 * numReads are also used as read indices, numWrites indices 
+			 * and write values.
+			 * Moreover, equalities between numArrays are encoded as bit-vectors
+			 * and integrated into the bit-vector layer. Therefore, they
+			 * may also contribute to read indices, write indices and write values.
+			 */
+			while (numWrites > 0 || numReads > 0 || numExtBV > 0) {
+				pars += generateBVWriteLayer (r, arrayNodes, bvNodes, 
+																			(numWrites >>> 1) + (numWrites & 1));
+				pars += generateBVArrayExtBVLayer (r, arrayNodes, bvNodes, 
+																					 (numExtBV >>> 1) + (numExtBV & 1));
+				pars += generateBVReadLayer (r, arrayNodes, bvNodes, 
+																		 (numReads >>> 1) + (numReads & 1));
+				numWrites >>>= 1;
+				numExtBV >>>= 1;
+				numReads >>>= 1;
+			}
+			assert (numWrites == 0);
+			assert (numReads == 0);
+			assert (numExtBV == 0);
+			/* create additional bit-vector layer on top to ensure
+			 * that numReads and equalities between numArrays are also used as
+			 * inputs for bit-vector operations.
+			 */
+			pars += generateBVLayer (r, bvNodes, minRefs, minBW, maxBW, bvDivMode,
+															 BVDivGuards, true, uFuncs, uPreds);
+			pars += generateBVPredicateLayer (r, bvNodes, boolNodes, minRefs,
+																				uPreds);
+			pars += addArrayExt (r, arrayNodes, boolNodes, numExtBool);
+		}
       break;
-      case AUFLIA: 
-      case QF_AUFLIA: {
-        int numWritesH, numReadsH;
-        ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
-        ArrayList<SMTType> sortsArray = new ArrayList<SMTType>();
-        ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> arrays = new ArrayList<SMTNode>();
-        ArrayList<UFunc> uFuncsInt = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
-        ArrayList<UFunc> uFuncsArray = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsArray = new ArrayList<UPred>();
-	System.out.print("(define-sort Index () Int)\n");
-	System.out.print("(define-sort Element () Int)\n");
+		case QF_A: 
+		case QF_AX: {
+			int numWritesH, numReadsH;
+			SMTType arrayType = ArrayType.arrayType; 
+			SMTType indexType = new UType ("Index");
+			SMTType elementType = new UType ("Element");
+			System.out.print("(declare-sort Index 0)\n");
+			System.out.print("(declare-sort Element 0)\n");
+			ArrayList<SMTNode> arrays = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> indices = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> elements = new ArrayList<SMTNode>();
+			generateVarsOfOneType (arrays, numArrays, arrayType);
+			generateVarsOfOneType (indices, numIndices, indexType);
+			generateVarsOfOneType (elements, numElements, elementType);
+			System.out.print ("(assert ");
+			numWritesH = (numWrites >>> 1) + (numWrites & 1);
+			numReadsH = (numReads >>> 1) + (numReads & 1);
+			numWrites >>>= 1;
+			numReads >>>= 1;
+			while (numWrites > 0 || numReads > 0) {
+				pars += generateWriteLayer (r, arrays, indices, elements, arrayType,
+																		(numWrites >>> 1) + (numWrites & 1));
+				pars += generateReadLayer (r, arrays, indices, elements, elementType,
+																	 (numReads >>> 1) + (numReads & 1));
+				numWrites >>>= 1;
+				numReads >>>= 1;
+			}
+			if (logic == SMTLogic.QF_AX)
+				pars += generateComparisonLayer (r, arrays, boolNodes, null, minRefs,
+																				 RelCompMode.EQ, false);
+			pars += generateComparisonLayer (r, indices, boolNodes, null, minRefs, 
+																			 RelCompMode.EQ, false);
+			pars += generateComparisonLayer (r, elements, boolNodes, null, minRefs, 
+																			 RelCompMode.EQ, false);
+			/* generate ITE Layer */
+			pars += generateITELayer (r, arrays, boolNodes, minRefs);
+			pars += generateITELayer (r, indices, boolNodes, minRefs);
+			pars += generateITELayer (r, elements, boolNodes, minRefs);
+			/* generate second write and read layer */
+			while (numWritesH > 0 || numReadsH > 0) {
+				pars += generateWriteLayer (r, arrays, indices, elements, arrayType, 
+																		(numWritesH >>> 1) + (numWritesH & 1));
+				pars += generateReadLayer (r, arrays, indices, elements, elementType,
+																	 (numReadsH >>> 1) + (numReadsH & 1));
+				numWritesH >>>= 1;
+				numReadsH >>>= 1;
+			}
+			if (logic == SMTLogic.QF_AX)
+				pars += generateComparisonLayer (r, arrays, boolNodes, null, minRefs, 
+																				 RelCompMode.EQ, false);
+			pars += generateComparisonLayer (r, indices, boolNodes, null, minRefs, 
+																			 RelCompMode.EQ, false);
+			pars += generateComparisonLayer (r, elements, boolNodes, null, minRefs, 
+																			 RelCompMode.EQ, false);
+		}
+      break;
+		case AUFLIA: 
+		case QF_AUFLIA: {
+			int numWritesH, numReadsH;
+			ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
+			ArrayList<SMTType> sortsArray = new ArrayList<SMTType>();
+			ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> arrays = new ArrayList<SMTNode>();
+			ArrayList<UFunc> uFuncsInt = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
+			ArrayList<UFunc> uFuncsArray = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsArray = new ArrayList<UPred>();
+			System.out.print("(define-sort Index () Int)\n");
+			System.out.print("(define-sort Element () Int)\n");
 
-        sortsInt.add (IntType.intType);
-        sortsArray.add (ArrayType.arrayType);
+			sortsInt.add (IntType.intType);
+			sortsArray.add (ArrayType.arrayType);
 
-        if (numUFuncsInt > 0)
-          generateUFuncs (r, sortsInt, uFuncsInt, numUFuncsInt, 
-                          minArgs, maxArgs);
-        if (numUFuncsArray > 0)
-          generateUFuncs (r, sortsArray, uFuncsArray, numUFuncsArray, 
-                          minArgs, maxArgs);
+			if (numUFuncsInt > 0)
+				generateUFuncs (r, sortsInt, uFuncsInt, numUFuncsInt, 
+												minArgs, maxArgs);
+			if (numUFuncsArray > 0)
+				generateUFuncs (r, sortsArray, uFuncsArray, numUFuncsArray, 
+												minArgs, maxArgs);
  
-        if (numUPredsInt > 0)
-          generateUPreds (r, sortsInt, uPredsInt, numUPredsInt, 
-                          minArgs, maxArgs);
-        if (numUPredsArray > 0)
-          generateUPreds (r, sortsArray, uPredsArray, numUPredsArray, 
-                          minArgs, maxArgs);
+			if (numUPredsInt > 0)
+				generateUPreds (r, sortsInt, uPredsInt, numUPredsInt, 
+												minArgs, maxArgs);
+			if (numUPredsArray > 0)
+				generateUPreds (r, sortsArray, uPredsArray, numUPredsArray, 
+												minArgs, maxArgs);
 
-        generateIntVars (intNodes, numVars);
-        generateVarsOfOneType (arrays, numArrays, ArrayType.arrayType);
-        System.out.print ("(assert ");
-        if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
-	    pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
-                               numQFormulasInt, minQVars, maxQVars, 
-                               minQNestings, maxQNestings, false, minRefs);
-        if (numQFormulasArray > 0 && (numUFuncsArray > 0 || numUPredsArray > 0))
-	    pars+=generateQFormulasUF (r, ArrayType.arrayType, uFuncsArray, 
-                               uPredsArray, numQFormulasArray, minQVars, 
-                               maxQVars, minQNestings, maxQNestings, true, 
-                               minRefs);
+			generateIntVars (intNodes, numVars);
+			generateVarsOfOneType (arrays, numArrays, ArrayType.arrayType);
+			System.out.print ("(assert ");
+			if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
+				pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
+																	 numQFormulasInt, minQVars, maxQVars, 
+																	 minQNestings, maxQNestings, false, minRefs);
+			if (numQFormulasArray > 0 && (numUFuncsArray > 0 || numUPredsArray > 0))
+				pars+=generateQFormulasUF (r, ArrayType.arrayType, uFuncsArray, 
+																	 uPredsArray, numQFormulasArray, minQVars, 
+																	 maxQVars, minQNestings, maxQNestings, true, 
+																	 minRefs);
 
-        pars += generateIntConsts (r, intConsts, numConsts, maxBW);
-        numWritesH = (numWrites >>> 1) + (numWrites & 1);
-        numReadsH = (numReads >>> 1) + (numReads & 1);
-        numWrites >>>= 1;
-        numReads >>>= 1;
-        pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
-                                  true, minRefs, true);
-        while (numWrites > 0 | numReads > 0){
-          pars += generateWriteLayer (r, arrays, intNodes, intNodes, 
-                                      ArrayType.arrayType, 
-                                      (numWrites >>> 1) + (numWrites & 1));
-          pars += generateReadLayer (r, arrays, intNodes, intNodes,
-                                     IntType.intType, 
-                                     (numReads >>> 1) + (numReads & 1));
-          numWrites >>>= 1;
-          numReads >>>= 1;
-        }
+			pars += generateIntConsts (r, intConsts, numConsts, maxBW);
+			numWritesH = (numWrites >>> 1) + (numWrites & 1);
+			numReadsH = (numReads >>> 1) + (numReads & 1);
+			numWrites >>>= 1;
+			numReads >>>= 1;
+			pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
+																true, minRefs, true);
+			while (numWrites > 0 | numReads > 0){
+				pars += generateWriteLayer (r, arrays, intNodes, intNodes, 
+																		ArrayType.arrayType, 
+																		(numWrites >>> 1) + (numWrites & 1));
+				pars += generateReadLayer (r, arrays, intNodes, intNodes,
+																	 IntType.intType, 
+																	 (numReads >>> 1) + (numReads & 1));
+				numWrites >>>= 1;
+				numReads >>>= 1;
+			}
 
-        if (numUFuncsArray > 0)
-          pars += generateUTermLayer (r, sortsArray, arrays, uFuncsArray, 
-                                      minRefs);
-        if (compModeArray == RelCompMode.EQ || numUPredsArray > 0)
-          pars += generateComparisonLayer (r, arrays, boolNodes, uPredsArray, 
-                                           minRefs, compModeArray, true);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
-                                         minRefs, RelCompMode.FULL, true);
-        pars += generateITELayer (r, arrays, boolNodes, minRefs);
-        pars += generateITELayer (r, intNodes, boolNodes, minRefs);
-        /* generate second write and read layer */
-        while (numWritesH > 0 || numReadsH > 0) {
-          pars += generateWriteLayer (r, arrays, intNodes, intNodes,
-                                      ArrayType.arrayType, 
-                                      (numWritesH >>> 1) + (numWritesH & 1));
-          pars += generateReadLayer (r, arrays, intNodes, intNodes,
-                                     IntType.intType, 
-                                     (numReadsH >>> 1) + (numReadsH & 1));
-          numWritesH >>>= 1;
-          numReadsH >>>= 1;
-        }
+			if (numUFuncsArray > 0)
+				pars += generateUTermLayer (r, sortsArray, arrays, uFuncsArray, 
+																		minRefs);
+			if (compModeArray == RelCompMode.EQ || numUPredsArray > 0)
+				pars += generateComparisonLayer (r, arrays, boolNodes, uPredsArray, 
+																				 minRefs, compModeArray, true);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
+																			 minRefs, RelCompMode.FULL, true);
+			pars += generateITELayer (r, arrays, boolNodes, minRefs);
+			pars += generateITELayer (r, intNodes, boolNodes, minRefs);
+			/* generate second write and read layer */
+			while (numWritesH > 0 || numReadsH > 0) {
+				pars += generateWriteLayer (r, arrays, intNodes, intNodes,
+																		ArrayType.arrayType, 
+																		(numWritesH >>> 1) + (numWritesH & 1));
+				pars += generateReadLayer (r, arrays, intNodes, intNodes,
+																	 IntType.intType, 
+																	 (numReadsH >>> 1) + (numReadsH & 1));
+				numWritesH >>>= 1;
+				numReadsH >>>= 1;
+			}
 
-        if (numUFuncsArray > 0)
-          pars += generateUTermLayer (r, sortsArray, arrays, uFuncsArray, 
-                                      minRefs);
-        pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
-                                  true, minRefs, true);
-        if (compModeArray == RelCompMode.EQ || numUPredsArray > 0)
-          pars += generateComparisonLayer (r, arrays, boolNodes, uPredsArray, 
-                                           minRefs, compModeArray, true);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
-                                         minRefs, RelCompMode.FULL, true);
-      }
+			if (numUFuncsArray > 0)
+				pars += generateUTermLayer (r, sortsArray, arrays, uFuncsArray, 
+																		minRefs);
+			pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
+																true, minRefs, true);
+			if (compModeArray == RelCompMode.EQ || numUPredsArray > 0)
+				pars += generateComparisonLayer (r, arrays, boolNodes, uPredsArray, 
+																				 minRefs, compModeArray, true);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
+																			 minRefs, RelCompMode.FULL, true);
+		}
       break;
-      case AUFLIRA:
-      case AUFNIRA: {
-        int numWritesArray1H, numWritesArray2H; 
-        int numReadsArray1H, numReadsArray2H;
-        HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
-        ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
-        ArrayList<SMTType> sortsReal = new ArrayList<SMTType>();
-        ArrayList<SMTType> sortsArray1 = new ArrayList<SMTType>();
-        ArrayList<SMTType> sortsArray2 = new ArrayList<SMTType>();
-        ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> realNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConstsAsReal = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> arrays1 = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> arrays2 = new ArrayList<SMTNode>();
-        ArrayList<UFunc> uFuncsInt = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
-        ArrayList<UFunc> uFuncsReal = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsReal = new ArrayList<UPred>();
-        ArrayList<UFunc> uFuncsArray1 = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsArray1 = new ArrayList<UPred>();
-        ArrayList<UFunc> uFuncsArray2 = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsArray2 = new ArrayList<UPred>();
-	System.out.print("(declare-sort Index 0)\n");
-	System.out.print("(declare-sort Element 0)\n");
+		case AUFLIRA:
+		case AUFNIRA: {
+			int numWritesArray1H, numWritesArray2H; 
+			int numReadsArray1H, numReadsArray2H;
+			HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
+			ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
+			ArrayList<SMTType> sortsReal = new ArrayList<SMTType>();
+			ArrayList<SMTType> sortsArray1 = new ArrayList<SMTType>();
+			ArrayList<SMTType> sortsArray2 = new ArrayList<SMTType>();
+			ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> realNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConstsAsReal = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> arrays1 = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> arrays2 = new ArrayList<SMTNode>();
+			ArrayList<UFunc> uFuncsInt = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
+			ArrayList<UFunc> uFuncsReal = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsReal = new ArrayList<UPred>();
+			ArrayList<UFunc> uFuncsArray1 = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsArray1 = new ArrayList<UPred>();
+			ArrayList<UFunc> uFuncsArray2 = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsArray2 = new ArrayList<UPred>();
+			System.out.print("(declare-sort Index 0)\n");
+			System.out.print("(declare-sort Element 0)\n");
 
-        sortsInt.add (IntType.intType);
-        sortsReal.add (RealType.realType);
-        sortsArray1.add (Array1Type.array1Type);
-        sortsArray2.add (Array2Type.array2Type);
+			sortsInt.add (IntType.intType);
+			sortsReal.add (RealType.realType);
+			sortsArray1.add (Array1Type.array1Type);
+			sortsArray2.add (Array2Type.array2Type);
 
-        if (numUFuncsInt > 0)
-          generateUFuncs (r, sortsInt, uFuncsInt, numUFuncsInt, 
-                          minArgs, maxArgs);
-        if (numUFuncsReal > 0)
-          generateUFuncs (r, sortsReal, uFuncsReal, numUFuncsReal, 
-                          minArgs, maxArgs);
-        if (numUFuncsArray1 > 0)
-          generateUFuncs (r, sortsArray1, uFuncsArray1, numUFuncsArray1, 
-                          minArgs, maxArgs);
-        if (numUFuncsArray2 > 0)
-          generateUFuncs (r, sortsArray2, uFuncsArray2, numUFuncsArray2, 
-                          minArgs, maxArgs);
+			if (numUFuncsInt > 0)
+				generateUFuncs (r, sortsInt, uFuncsInt, numUFuncsInt, 
+												minArgs, maxArgs);
+			if (numUFuncsReal > 0)
+				generateUFuncs (r, sortsReal, uFuncsReal, numUFuncsReal, 
+												minArgs, maxArgs);
+			if (numUFuncsArray1 > 0)
+				generateUFuncs (r, sortsArray1, uFuncsArray1, numUFuncsArray1, 
+												minArgs, maxArgs);
+			if (numUFuncsArray2 > 0)
+				generateUFuncs (r, sortsArray2, uFuncsArray2, numUFuncsArray2, 
+												minArgs, maxArgs);
  
-        if (numUPredsInt > 0)
-          generateUPreds (r, sortsInt, uPredsInt, numUPredsInt, 
-                          minArgs, maxArgs);
-        if (numUPredsReal > 0)
-          generateUPreds (r, sortsReal, uPredsReal, numUPredsReal, 
-                          minArgs, maxArgs);
-        if (numUPredsArray1 > 0)
-          generateUPreds (r, sortsArray1, uPredsArray1, numUPredsArray1, 
-                          minArgs, maxArgs);
-        if (numUPredsArray2 > 0)
-          generateUPreds (r, sortsArray2, uPredsArray2, numUPredsArray2, 
-                          minArgs, maxArgs);
+			if (numUPredsInt > 0)
+				generateUPreds (r, sortsInt, uPredsInt, numUPredsInt, 
+												minArgs, maxArgs);
+			if (numUPredsReal > 0)
+				generateUPreds (r, sortsReal, uPredsReal, numUPredsReal, 
+												minArgs, maxArgs);
+			if (numUPredsArray1 > 0)
+				generateUPreds (r, sortsArray1, uPredsArray1, numUPredsArray1, 
+												minArgs, maxArgs);
+			if (numUPredsArray2 > 0)
+				generateUPreds (r, sortsArray2, uPredsArray2, numUPredsArray2, 
+												minArgs, maxArgs);
 
-        generateIntVars (intNodes, numVarsInt);
-        generateRealVars (realNodes, numVarsReal);
-        generateVarsOfOneType (arrays1, numArrays1, Array1Type.array1Type);
-        generateVarsOfOneType (arrays2, numArrays2, Array2Type.array2Type);
+			generateIntVars (intNodes, numVarsInt);
+			generateRealVars (realNodes, numVarsReal);
+			generateVarsOfOneType (arrays1, numArrays1, Array1Type.array1Type);
+			generateVarsOfOneType (arrays2, numArrays2, Array2Type.array2Type);
 
-        System.out.print ("(assert ");
-        if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
-	    pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
-                               numQFormulasInt, minQVars, maxQVars, 
-                               minQNestings, maxQNestings, false, minRefs);
-        if (numQFormulasReal > 0 && (numUFuncsReal > 0 || numUPredsReal > 0))
-	    pars+=generateQFormulasUF (r, RealType.realType, uFuncsReal, uPredsReal,
-                               numQFormulasReal, minQVars, maxQVars, 
-                               minQNestings, maxQNestings, false, minRefs);
-        if (numQFormulasArray1 > 0 
-            && (numUFuncsArray1 > 0 || numUPredsArray1 > 0))
-          pars+=generateQFormulasUF (r, Array1Type.array1Type, uFuncsArray1, 
-                               uPredsArray1, numQFormulasArray1, minQVars, 
-                               maxQVars, minQNestings, maxQNestings, true, 
-                               minRefs);
-        if (numQFormulasArray2 > 0 
-            && (numUFuncsArray2 > 0 || numUPredsArray2 > 0))
-          pars+=generateQFormulasUF (r, Array2Type.array2Type, uFuncsArray2, 
-                               uPredsArray2, numQFormulasArray2, minQVars, 
-                               maxQVars, minQNestings, maxQNestings, true, 
-                               minRefs);
+			System.out.print ("(assert ");
+			if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
+				pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
+																	 numQFormulasInt, minQVars, maxQVars, 
+																	 minQNestings, maxQNestings, false, minRefs);
+			if (numQFormulasReal > 0 && (numUFuncsReal > 0 || numUPredsReal > 0))
+				pars+=generateQFormulasUF (r, RealType.realType, uFuncsReal, uPredsReal,
+																	 numQFormulasReal, minQVars, maxQVars, 
+																	 minQNestings, maxQNestings, false, minRefs);
+			if (numQFormulasArray1 > 0 
+					&& (numUFuncsArray1 > 0 || numUPredsArray1 > 0))
+				pars+=generateQFormulasUF (r, Array1Type.array1Type, uFuncsArray1, 
+																	 uPredsArray1, numQFormulasArray1, minQVars, 
+																	 maxQVars, minQNestings, maxQNestings, true, 
+																	 minRefs);
+			if (numQFormulasArray2 > 0 
+					&& (numUFuncsArray2 > 0 || numUPredsArray2 > 0))
+				pars+=generateQFormulasUF (r, Array2Type.array2Type, uFuncsArray2, 
+																	 uPredsArray2, numQFormulasArray2, minQVars, 
+																	 maxQVars, minQNestings, maxQNestings, true, 
+																	 minRefs);
 
-        pars += generateIntConsts (r, intConsts, numConstsInt, maxBW);
-        pars += generateRealConstsNotFilledZero (r, intConstsAsReal, zeroConsts,
-                                                 numConstsIntAsReal, maxBW, 
-                                                 true);
-        pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
-                                  true, minRefs, true);
-        pars += generateRealLayer (r, realNodes, intConstsAsReal, zeroConsts, 
-                                   uFuncsReal, uPredsReal, linear, true, 
-                                   minRefs, false);
+			pars += generateIntConsts (r, intConsts, numConstsInt, maxBW);
+			pars += generateRealConstsNotFilledZero (r, intConstsAsReal, zeroConsts,
+																							 numConstsIntAsReal, maxBW, 
+																							 true);
+			pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
+																true, minRefs, true);
+			pars += generateRealLayer (r, realNodes, intConstsAsReal, zeroConsts, 
+																 uFuncsReal, uPredsReal, linear, true, 
+																 minRefs, false);
 
-        numWritesArray1H = (numWritesArray1 >>> 1) + (numWritesArray1 & 1);
-        numReadsArray1H = (numReadsArray1 >>> 1) + (numReadsArray1 & 1);
-        numWritesArray1 >>>= 1;
-        numReadsArray1 >>>= 1;
-        numWritesArray2H = (numWritesArray2 >>> 1) + (numWritesArray2 & 1);
-        numReadsArray2H = (numReadsArray2 >>> 1) + (numReadsArray2 & 1);
-        numWritesArray2 >>>= 1;
-        numReadsArray2 >>>= 1;
-        /* interleave both array phases */
-        while (numWritesArray1 > 0 || numReadsArray1 > 0 ||
-               numWritesArray2 > 0 || numReadsArray2 > 0){
-          pars += generateWriteLayer (r, arrays1, intNodes, realNodes, 
-                                      Array1Type.array1Type, 
-                                      (numWritesArray1 >>> 1) + 
-                                      (numWritesArray1 & 1));
-          pars += generateReadLayer (r, arrays1, intNodes, realNodes,
-                                     RealType.realType, 
-                                     (numReadsArray1 >>> 1) + 
-                                     (numReadsArray1 & 1));
-          pars += generateWriteLayer (r, arrays2, intNodes, arrays1, 
-                                      Array2Type.array2Type, 
-                                      (numWritesArray2 >>> 1) + 
-                                      (numWritesArray2 & 1));
-          pars += generateReadLayer (r, arrays2, intNodes, arrays1,
-                                     Array1Type.array1Type,
-                                     (numReadsArray2 >>> 1) + 
-                                     (numReadsArray2 & 1));
-          numWritesArray1 >>>= 1;
-          numReadsArray1 >>>= 1;
-          numWritesArray2 >>>= 1;
-          numReadsArray2 >>>= 1;
+			numWritesArray1H = (numWritesArray1 >>> 1) + (numWritesArray1 & 1);
+			numReadsArray1H = (numReadsArray1 >>> 1) + (numReadsArray1 & 1);
+			numWritesArray1 >>>= 1;
+			numReadsArray1 >>>= 1;
+			numWritesArray2H = (numWritesArray2 >>> 1) + (numWritesArray2 & 1);
+			numReadsArray2H = (numReadsArray2 >>> 1) + (numReadsArray2 & 1);
+			numWritesArray2 >>>= 1;
+			numReadsArray2 >>>= 1;
+			/* interleave both array phases */
+			while (numWritesArray1 > 0 || numReadsArray1 > 0 ||
+						 numWritesArray2 > 0 || numReadsArray2 > 0){
+				pars += generateWriteLayer (r, arrays1, intNodes, realNodes, 
+																		Array1Type.array1Type, 
+																		(numWritesArray1 >>> 1) + 
+																		(numWritesArray1 & 1));
+				pars += generateReadLayer (r, arrays1, intNodes, realNodes,
+																	 RealType.realType, 
+																	 (numReadsArray1 >>> 1) + 
+																	 (numReadsArray1 & 1));
+				pars += generateWriteLayer (r, arrays2, intNodes, arrays1, 
+																		Array2Type.array2Type, 
+																		(numWritesArray2 >>> 1) + 
+																		(numWritesArray2 & 1));
+				pars += generateReadLayer (r, arrays2, intNodes, arrays1,
+																	 Array1Type.array1Type,
+																	 (numReadsArray2 >>> 1) + 
+																	 (numReadsArray2 & 1));
+				numWritesArray1 >>>= 1;
+				numReadsArray1 >>>= 1;
+				numWritesArray2 >>>= 1;
+				numReadsArray2 >>>= 1;
 
-        }
+			}
 
-        if (numUFuncsArray1 > 0)
-          pars += generateUTermLayer (r, sortsArray1, arrays1, uFuncsArray1, 
-                                      minRefs);
-        if (numUFuncsArray2 > 0)
-          pars += generateUTermLayer (r, sortsArray2, arrays2, uFuncsArray2, 
-                                      minRefs);
-        if (compModeArray1 == RelCompMode.EQ || numUPredsArray1 > 0)
-          pars += generateComparisonLayer (r, arrays1, boolNodes, uPredsArray1, 
-                                           minRefs, compModeArray1, true);
-        if (compModeArray2 == RelCompMode.EQ || numUPredsArray2 > 0)
-          pars += generateComparisonLayer (r, arrays2, boolNodes, uPredsArray2, 
-                                           minRefs, compModeArray2, true);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
-                                         minRefs, RelCompMode.FULL, true);
-        pars += generateComparisonLayer (r, realNodes, boolNodes, uPredsReal, 
-                                         minRefs, RelCompMode.FULL, true);
-        pars += generateITELayer (r, arrays1, boolNodes, minRefs);
-        pars += generateITELayer (r, arrays2, boolNodes, minRefs);
-        pars += generateITELayer (r, intNodes, boolNodes, minRefs);
-        pars += generateITELayer (r, realNodes, boolNodes, minRefs);
-        /* generate second write and read phase */
-        while (numWritesArray1H > 0 || numReadsArray1H > 0 ||
-               numWritesArray2H > 0 || numReadsArray2H > 0) {
-          pars += generateWriteLayer (r, arrays1, intNodes, realNodes,
-                                      Array1Type.array1Type, 
-                                      (numWritesArray1H >>> 1) + 
-                                      (numWritesArray1H & 1));
-          pars += generateReadLayer (r, arrays1, intNodes, realNodes,
-                                     RealType.realType, 
-                                     (numReadsArray1H >>> 1) + 
-                                     (numReadsArray1H & 1));
-          pars += generateWriteLayer (r, arrays2, intNodes, arrays1,
-                                      Array2Type.array2Type, 
-                                      (numWritesArray2H >>> 1) + 
-                                      (numWritesArray2H & 1));
-          pars += generateReadLayer (r, arrays2, intNodes, arrays1,
-                                     Array1Type.array1Type, 
-                                     (numReadsArray2H >>> 1) + 
-                                     (numReadsArray2H & 1));
-          numWritesArray1H >>>= 1;
-          numReadsArray1H >>>= 1;
-          numWritesArray2H >>>= 1;
-          numReadsArray2H >>>= 1;
-        }
+			if (numUFuncsArray1 > 0)
+				pars += generateUTermLayer (r, sortsArray1, arrays1, uFuncsArray1, 
+																		minRefs);
+			if (numUFuncsArray2 > 0)
+				pars += generateUTermLayer (r, sortsArray2, arrays2, uFuncsArray2, 
+																		minRefs);
+			if (compModeArray1 == RelCompMode.EQ || numUPredsArray1 > 0)
+				pars += generateComparisonLayer (r, arrays1, boolNodes, uPredsArray1, 
+																				 minRefs, compModeArray1, true);
+			if (compModeArray2 == RelCompMode.EQ || numUPredsArray2 > 0)
+				pars += generateComparisonLayer (r, arrays2, boolNodes, uPredsArray2, 
+																				 minRefs, compModeArray2, true);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
+																			 minRefs, RelCompMode.FULL, true);
+			pars += generateComparisonLayer (r, realNodes, boolNodes, uPredsReal, 
+																			 minRefs, RelCompMode.FULL, true);
+			pars += generateITELayer (r, arrays1, boolNodes, minRefs);
+			pars += generateITELayer (r, arrays2, boolNodes, minRefs);
+			pars += generateITELayer (r, intNodes, boolNodes, minRefs);
+			pars += generateITELayer (r, realNodes, boolNodes, minRefs);
+			/* generate second write and read phase */
+			while (numWritesArray1H > 0 || numReadsArray1H > 0 ||
+						 numWritesArray2H > 0 || numReadsArray2H > 0) {
+				pars += generateWriteLayer (r, arrays1, intNodes, realNodes,
+																		Array1Type.array1Type, 
+																		(numWritesArray1H >>> 1) + 
+																		(numWritesArray1H & 1));
+				pars += generateReadLayer (r, arrays1, intNodes, realNodes,
+																	 RealType.realType, 
+																	 (numReadsArray1H >>> 1) + 
+																	 (numReadsArray1H & 1));
+				pars += generateWriteLayer (r, arrays2, intNodes, arrays1,
+																		Array2Type.array2Type, 
+																		(numWritesArray2H >>> 1) + 
+																		(numWritesArray2H & 1));
+				pars += generateReadLayer (r, arrays2, intNodes, arrays1,
+																	 Array1Type.array1Type, 
+																	 (numReadsArray2H >>> 1) + 
+																	 (numReadsArray2H & 1));
+				numWritesArray1H >>>= 1;
+				numReadsArray1H >>>= 1;
+				numWritesArray2H >>>= 1;
+				numReadsArray2H >>>= 1;
+			}
 
-        if (numUFuncsArray1 > 0)
-          pars += generateUTermLayer (r, sortsArray1, arrays1, uFuncsArray1, 
-                                      minRefs);
-        if (numUFuncsArray2 > 0)
-          pars += generateUTermLayer (r, sortsArray2, arrays2, uFuncsArray2, 
-                                      minRefs);
-        pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
-                                  true, minRefs, true);
-        if (compModeArray1 == RelCompMode.EQ || numUPredsArray1 > 0)
-          pars += generateComparisonLayer (r, arrays1, boolNodes, uPredsArray1, 
-                                           minRefs, compModeArray1, true);
-        if (compModeArray2 == RelCompMode.EQ || numUPredsArray2 > 0)
-          pars += generateComparisonLayer (r, arrays2, boolNodes, uPredsArray2, 
-                                           minRefs, compModeArray2, true);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
-                                         minRefs, RelCompMode.FULL, true);
-        pars += generateComparisonLayer (r, realNodes, boolNodes, uPredsReal, 
-                                         minRefs, RelCompMode.FULL, true);
-      }
+			if (numUFuncsArray1 > 0)
+				pars += generateUTermLayer (r, sortsArray1, arrays1, uFuncsArray1, 
+																		minRefs);
+			if (numUFuncsArray2 > 0)
+				pars += generateUTermLayer (r, sortsArray2, arrays2, uFuncsArray2, 
+																		minRefs);
+			pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
+																true, minRefs, true);
+			if (compModeArray1 == RelCompMode.EQ || numUPredsArray1 > 0)
+				pars += generateComparisonLayer (r, arrays1, boolNodes, uPredsArray1, 
+																				 minRefs, compModeArray1, true);
+			if (compModeArray2 == RelCompMode.EQ || numUPredsArray2 > 0)
+				pars += generateComparisonLayer (r, arrays2, boolNodes, uPredsArray2, 
+																				 minRefs, compModeArray2, true);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
+																			 minRefs, RelCompMode.FULL, true);
+			pars += generateComparisonLayer (r, realNodes, boolNodes, uPredsReal, 
+																			 minRefs, RelCompMode.FULL, true);
+		}
       break;
 
-      case QF_IDL: {
-        ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        generateIntVars (intNodes, numVars);
-	System.out.print ("(assert ");
-        pars += generateIntConsts (r, intConsts, numConsts, maxBW);
-        pars += generateIDLLayer (r, intNodes, intConsts, boolNodes, minRefs);
-      }
+		case QF_IDL: {
+			ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			generateIntVars (intNodes, numVars);
+			System.out.print ("(assert ");
+			pars += generateIntConsts (r, intConsts, numConsts, maxBW);
+			pars += generateIDLLayer (r, intNodes, intConsts, boolNodes, minRefs);
+		}
       break;
-      case QF_UFIDL: {
-        ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
-        ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
-        ArrayList<UPred> uPreds = new ArrayList<UPred>();
+		case QF_UFIDL: {
+			ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
+			ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
+			ArrayList<UPred> uPreds = new ArrayList<UPred>();
 
-        sortsInt.add (IntType.intType);
+			sortsInt.add (IntType.intType);
 
-        generateIntVars (intNodes, numVars);
-        if (numUFuncs > 0)
-          generateUFuncs (r, sortsInt, uFuncs, numUFuncs, minArgs, maxArgs);
-        if (numUPreds > 0)
-          generateUPreds (r, sortsInt, uPreds, numUPreds, minArgs, maxArgs);
-	System.out.print ("(assert ");
-        pars += generateIntConsts (r, intConsts, numConsts, maxBW);
-        pars += generateIDLLayer (r, intNodes, intConsts, boolNodes, minRefs);
-        if (numUFuncs > 0)
-          pars += generateUTermLayer (r, sortsInt, intNodes, uFuncs, minRefs);
-        if (numUPreds > 0) 
-          pars += generateUPredLayer (r, intNodes, boolNodes, uPreds, minRefs);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPreds, 
-                                         minRefs, RelCompMode.FULL, true);
-      }
+			generateIntVars (intNodes, numVars);
+			if (numUFuncs > 0)
+				generateUFuncs (r, sortsInt, uFuncs, numUFuncs, minArgs, maxArgs);
+			if (numUPreds > 0)
+				generateUPreds (r, sortsInt, uPreds, numUPreds, minArgs, maxArgs);
+			System.out.print ("(assert ");
+			pars += generateIntConsts (r, intConsts, numConsts, maxBW);
+			pars += generateIDLLayer (r, intNodes, intConsts, boolNodes, minRefs);
+			if (numUFuncs > 0)
+				pars += generateUTermLayer (r, sortsInt, intNodes, uFuncs, minRefs);
+			if (numUPreds > 0) 
+				pars += generateUPredLayer (r, intNodes, boolNodes, uPreds, minRefs);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPreds, 
+																			 minRefs, RelCompMode.FULL, true);
+		}
       break;
-      case QF_RDL: {
-        ArrayList<SMTNode> realVars = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
-        generateRealVars (realVars, numVars);
-	System.out.print ("(assert ");
-        pars += generateIntConstsNotFilledZero (r, intConsts, zeroConsts, 
-                                                numConsts, maxBW);
-        pars += generateRDLLayer (r, realVars, intConsts, zeroConsts, 
-                                  boolNodes, minRefs, maxBW);
-      }
+		case QF_RDL: {
+			ArrayList<SMTNode> realVars = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
+			generateRealVars (realVars, numVars);
+			System.out.print ("(assert ");
+			pars += generateIntConstsNotFilledZero (r, intConsts, zeroConsts, 
+																							numConsts, maxBW);
+			pars += generateRDLLayer (r, realVars, intConsts, zeroConsts, 
+																boolNodes, minRefs, maxBW);
+		}
       break;
-      case QF_UFRDL: {
-        ArrayList<SMTType> sortsReal = new ArrayList<SMTType>();
-        ArrayList<SMTNode> realNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
-        ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
-        ArrayList<UPred> uPreds = new ArrayList<UPred>();
+		case QF_UFRDL: {
+			ArrayList<SMTType> sortsReal = new ArrayList<SMTType>();
+			ArrayList<SMTNode> realNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
+			ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
+			ArrayList<UPred> uPreds = new ArrayList<UPred>();
 
-        sortsReal.add (RealType.realType);
+			sortsReal.add (RealType.realType);
 
-        generateRealVars (realNodes, numVars);
-        if (numUFuncs > 0)
-          generateUFuncs (r, sortsReal, uFuncs, numUFuncs, minArgs, maxArgs);
-        if (numUPreds > 0)
-          generateUPreds (r, sortsReal, uPreds, numUPreds, minArgs, maxArgs);
-	System.out.print ("(assert ");
-        pars += generateIntConstsNotFilledZero (r, intConsts, zeroConsts, 
-                                                numConsts, maxBW);
-        pars += generateRDLLayer (r, realNodes, intConsts, zeroConsts, 
-                                  boolNodes, minRefs, maxBW);
-        if (numUFuncs > 0)
-          pars += generateUTermLayer (r, sortsReal, realNodes, uFuncs, minRefs);
-        if (numUPreds > 0) 
-          pars += generateUPredLayer (r, realNodes, boolNodes, uPreds, minRefs);
-        pars += generateComparisonLayer (r, realNodes, boolNodes, uPreds, 
-                                         minRefs, RelCompMode.FULL, true);
-      }
+			generateRealVars (realNodes, numVars);
+			if (numUFuncs > 0)
+				generateUFuncs (r, sortsReal, uFuncs, numUFuncs, minArgs, maxArgs);
+			if (numUPreds > 0)
+				generateUPreds (r, sortsReal, uPreds, numUPreds, minArgs, maxArgs);
+			System.out.print ("(assert ");
+			pars += generateIntConstsNotFilledZero (r, intConsts, zeroConsts, 
+																							numConsts, maxBW);
+			pars += generateRDLLayer (r, realNodes, intConsts, zeroConsts, 
+																boolNodes, minRefs, maxBW);
+			if (numUFuncs > 0)
+				pars += generateUTermLayer (r, sortsReal, realNodes, uFuncs, minRefs);
+			if (numUPreds > 0) 
+				pars += generateUPredLayer (r, realNodes, boolNodes, uPreds, minRefs);
+			pars += generateComparisonLayer (r, realNodes, boolNodes, uPreds, 
+																			 minRefs, RelCompMode.FULL, true);
+		}
       break;
-      case QF_LIA:
-      case QF_NIA:
-      case QF_UFLIA:
-      case QF_UFNIA: {
-        ArrayList<SMTType> sorts = new ArrayList<SMTType>();
-        ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
-        ArrayList<UPred> uPreds = new ArrayList<UPred>();
+		case QF_LIA:
+		case QF_NIA:
+		case QF_UFLIA:
+		case QF_UFNIA: {
+			ArrayList<SMTType> sorts = new ArrayList<SMTType>();
+			ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
+			ArrayList<UPred> uPreds = new ArrayList<UPred>();
 
-        sorts.add (IntType.intType);
+			sorts.add (IntType.intType);
 
-        if (numUFuncs > 0)
-          generateUFuncs (r, sorts, uFuncs, numUFuncs, minArgs, maxArgs);
-        if (numUPreds > 0)
-          generateUPreds (r, sorts, uPreds, numUPreds, minArgs, maxArgs);
+			if (numUFuncs > 0)
+				generateUFuncs (r, sorts, uFuncs, numUFuncs, minArgs, maxArgs);
+			if (numUPreds > 0)
+				generateUPreds (r, sorts, uPreds, numUPreds, minArgs, maxArgs);
 
-        generateIntVars (intNodes, numVars);
-	System.out.print ("(assert ");
-        pars += generateIntConsts (r, intConsts, numConsts, maxBW);
-        pars += generateIntLayer (r, intNodes, intConsts, uFuncs, uPreds,
-                                  linear, minRefs, false);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPreds, 
-                                         minRefs, RelCompMode.FULL, false);
-        pars += generateITELayer (r, intNodes, boolNodes, minRefs);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPreds, 
-                                         minRefs, RelCompMode.FULL, false);
-      }
+			generateIntVars (intNodes, numVars);
+			System.out.print ("(assert ");
+			pars += generateIntConsts (r, intConsts, numConsts, maxBW);
+			pars += generateIntLayer (r, intNodes, intConsts, uFuncs, uPreds,
+																linear, minRefs, false);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPreds, 
+																			 minRefs, RelCompMode.FULL, false);
+			pars += generateITELayer (r, intNodes, boolNodes, minRefs);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPreds, 
+																			 minRefs, RelCompMode.FULL, false);
+		}
       break;
-      case QF_LRA:
-      case QF_NRA:
-      case QF_UFLRA:
-      case QF_UFNRA: {
-        ArrayList<SMTType> sorts = new ArrayList<SMTType>();
-        ArrayList<SMTNode> realNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConstsAsReal = new ArrayList<SMTNode>();
-        HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
-        ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
-        ArrayList<UPred> uPreds = new ArrayList<UPred>();
+		case QF_LRA:
+		case QF_NRA:
+		case QF_UFLRA:
+		case QF_UFNRA: {
+			ArrayList<SMTType> sorts = new ArrayList<SMTType>();
+			ArrayList<SMTNode> realNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConstsAsReal = new ArrayList<SMTNode>();
+			HashSet<SMTNode> zeroConsts = new HashSet<SMTNode>();
+			ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
+			ArrayList<UPred> uPreds = new ArrayList<UPred>();
 
-        sorts.add (RealType.realType);
+			sorts.add (RealType.realType);
 
-        if (numUFuncs > 0)
-          generateUFuncs (r, sorts, uFuncs, numUFuncs, minArgs, maxArgs);
-        if (numUPreds > 0)
-          generateUPreds (r, sorts, uPreds, numUPreds, minArgs, maxArgs);
+			if (numUFuncs > 0)
+				generateUFuncs (r, sorts, uFuncs, numUFuncs, minArgs, maxArgs);
+			if (numUPreds > 0)
+				generateUPreds (r, sorts, uPreds, numUPreds, minArgs, maxArgs);
 
-        generateRealVars (realNodes, numVars);
-	System.out.print ("(assert ");
-        pars += generateRealConstsNotFilledZero (r, intConstsAsReal, zeroConsts,
-                                                 numConsts, maxBW, false);
-        pars += generateRealLayer (r, realNodes, intConstsAsReal, zeroConsts, 
-                                   uFuncs, uPreds, linear, false, minRefs, 
-                                   false);
-        pars += generateComparisonLayer (r, realNodes, boolNodes, uPreds,
-                                         minRefs, RelCompMode.FULL, false);
-        pars += generateITELayer (r, realNodes, boolNodes, minRefs);
-        pars += generateComparisonLayer (r, realNodes, boolNodes, uPreds, 
-                                         minRefs, RelCompMode.FULL, false);
-      }
+			generateRealVars (realNodes, numVars);
+			System.out.print ("(assert ");
+			pars += generateRealConstsNotFilledZero (r, intConstsAsReal, zeroConsts,
+																							 numConsts, maxBW, false);
+			pars += generateRealLayer (r, realNodes, intConstsAsReal, zeroConsts, 
+																 uFuncs, uPreds, linear, false, minRefs, 
+																 false);
+			pars += generateComparisonLayer (r, realNodes, boolNodes, uPreds,
+																			 minRefs, RelCompMode.FULL, false);
+			pars += generateITELayer (r, realNodes, boolNodes, minRefs);
+			pars += generateComparisonLayer (r, realNodes, boolNodes, uPreds, 
+																			 minRefs, RelCompMode.FULL, false);
+		}
       break;
-      case QF_UF: {
-        ArrayList<SMTType> sorts = new ArrayList<SMTType>();
-        ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
-        ArrayList<UPred> uPreds = new ArrayList<UPred>();
-        ArrayList<SMTNode> nodes = new ArrayList<SMTNode>();
-        generateUTypes (sorts, numSorts);
-        generateUVars  (sorts, nodes, numVars);
-        generateUFuncs (r, sorts, uFuncs, minNumUFuncs, minArgs, maxArgs);
-        generateUPreds (r, sorts, uPreds, minNumUPreds, minArgs, maxArgs);
-	System.out.print ("(assert ");
-        pars += generateUTermLayer (r, sorts, nodes, uFuncs, minRefs);
-        pars += generateUPredLayer (r, nodes, boolNodes, uPreds, minRefs);
-        pars += generateITELayer (r, nodes, boolNodes, 1); 
-        pars += generateUPredLayer (r, nodes, boolNodes, uPreds, minRefs);
-      }
+		case QF_UF: {
+			ArrayList<SMTType> sorts = new ArrayList<SMTType>();
+			ArrayList<UFunc> uFuncs = new ArrayList<UFunc>();
+			ArrayList<UPred> uPreds = new ArrayList<UPred>();
+			ArrayList<SMTNode> nodes = new ArrayList<SMTNode>();
+			generateUTypes (sorts, numSorts);
+			generateUVars  (sorts, nodes, numVars);
+			generateUFuncs (r, sorts, uFuncs, minNumUFuncs, minArgs, maxArgs);
+			generateUPreds (r, sorts, uPreds, minNumUPreds, minArgs, maxArgs);
+			System.out.print ("(assert ");
+			pars += generateUTermLayer (r, sorts, nodes, uFuncs, minRefs);
+			pars += generateUPredLayer (r, nodes, boolNodes, uPreds, minRefs);
+			pars += generateITELayer (r, nodes, boolNodes, 1); 
+			pars += generateUPredLayer (r, nodes, boolNodes, uPreds, minRefs);
+		}
       break;
-      case QF_UFLIA_SETS: {
-        ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
-        ArrayList<SMTType> sortsSet = new ArrayList<SMTType>();
-        ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
-        ArrayList<SMTNode> sets = new ArrayList<SMTNode>();
-        ArrayList<UFunc> uFuncsInt = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
-        ArrayList<UFunc> uFuncsSet = new ArrayList<UFunc>();
-        ArrayList<UPred> uPredsSet = new ArrayList<UPred>();
-        System.out.println ("(define-sort Element () Int)");
+		case QF_UFLIA_SETS: {
+			ArrayList<SMTType> sortsInt = new ArrayList<SMTType>();
+			ArrayList<SMTType> sortsSet = new ArrayList<SMTType>();
+			ArrayList<SMTNode> intNodes = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> intConsts = new ArrayList<SMTNode>();
+			ArrayList<SMTNode> sets = new ArrayList<SMTNode>();
+			ArrayList<UFunc> uFuncsInt = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsInt = new ArrayList<UPred>();
+			ArrayList<UFunc> uFuncsSet = new ArrayList<UFunc>();
+			ArrayList<UPred> uPredsSet = new ArrayList<UPred>();
+			System.out.println ("(define-sort Element () Int)");
 
-        sortsInt.add (IntType.intType);
-        sortsSet.add (SetType.setType);
+			sortsInt.add (IntType.intType);
+			sortsSet.add (SetType.setType);
 
-        if (numUFuncsInt > 0)
-          generateUFuncs (r, sortsInt, uFuncsInt, numUFuncsInt, 
-                          minArgs, maxArgs);
-        if (numUFuncsSets > 0)
-          generateUFuncs (r, sortsSet, uFuncsSet, numUFuncsSets, 
-                          minArgs, maxArgs);
+			if (numUFuncsInt > 0)
+				generateUFuncs (r, sortsInt, uFuncsInt, numUFuncsInt, 
+												minArgs, maxArgs);
+			if (numUFuncsSets > 0)
+				generateUFuncs (r, sortsSet, uFuncsSet, numUFuncsSets, 
+												minArgs, maxArgs);
  
-        if (numUPredsInt > 0)
-          generateUPreds (r, sortsInt, uPredsInt, numUPredsInt, 
-                          minArgs, maxArgs);
-        if (numUPredsSets > 0)
-          generateUPreds (r, sortsSet, uPredsSet, numUPredsSets, 
-                          minArgs, maxArgs);
+			if (numUPredsInt > 0)
+				generateUPreds (r, sortsInt, uPredsInt, numUPredsInt, 
+												minArgs, maxArgs);
+			if (numUPredsSets > 0)
+				generateUPreds (r, sortsSet, uPredsSet, numUPredsSets, 
+												minArgs, maxArgs);
 
-        generateIntVars (intNodes, numVars);
-        generateVarsOfOneType (sets, numSets, SetType.setType);
+			generateIntVars (intNodes, numVars);
+			generateVarsOfOneType (sets, numSets, SetType.setType);
 
-        System.out.print ("(assert ");
-        if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
-	    pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
-                               numQFormulasInt, minQVars, maxQVars, 
-                               minQNestings, maxQNestings, false, minRefs);
+			System.out.print ("(assert ");
+			if (numQFormulasInt > 0 && (numUFuncsInt > 0 || numUPredsInt > 0))
+				pars+=generateQFormulasUF (r, IntType.intType, uFuncsInt, uPredsInt,
+																	 numQFormulasInt, minQVars, maxQVars, 
+																	 minQNestings, maxQNestings, false, minRefs);
 
-        /* To add: if QFormulasSets > 0 */
+			/* To add: if QFormulasSets > 0 */
 
-        pars += generateIntConsts (r, intConsts, numConsts, maxBW);
-        pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
-                                  true, minRefs, true);
-        pars += generateSetsLayer (r, sets, uFuncsSet, uPredsSet, minRefs,
-                                   true);
-        pars += generateSetsMemberLayer(r, intNodes, sets, boolNodes,
-                                        numMembers);
+			pars += generateIntConsts (r, intConsts, numConsts, maxBW);
+			pars += generateIntLayer (r, intNodes, intConsts, uFuncsInt, uPredsInt,
+																true, minRefs, true);
+			pars += generateSetsLayer (r, sets, uFuncsSet, uPredsSet, minRefs,
+																 true);
+			pars += generateSetsMemberLayer(r, intNodes, sets, boolNodes,
+																			numMembers);
 
-        if (numUFuncsSets > 0)
-          pars += generateUTermLayer (r, sortsSet, sets, uFuncsSet, 
-                                      minRefs);
-        pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
-                                         minRefs, RelCompMode.FULL, true);
-        pars += generateITELayer (r, sets, boolNodes, minRefs);
-        pars += generateITELayer (r, intNodes, boolNodes, minRefs);
-      }
-      break;
+			if (numUFuncsSets > 0)
+				pars += generateUTermLayer (r, sortsSet, sets, uFuncsSet, 
+																		minRefs);
+			pars += generateComparisonLayer (r, intNodes, boolNodes, uPredsInt, 
+																			 minRefs, RelCompMode.FULL, true);
+			pars += generateITELayer (r, sets, boolNodes, minRefs);
+			pars += generateITELayer (r, intNodes, boolNodes, minRefs);
+		}
+			break;
+		
     }/* switch */
 
     /* generate boolean layer */
     assert (boolNodes.size() > 0);
     switch (booleanLayerKind) {
-      case RANDOM:
-        pars += generateBooleanLayer (r, boolNodes);
-        break;
-      case AND:
-        pars += generateBooleanTopAnd (boolNodes);
-        break;
-      case OR:
-        pars += generateBooleanTopOr (boolNodes);
-        break;
-      case CNF:
-        pars += generateBooleanCNF (r, boolNodes, factor);
-        break;
+		case RANDOM:
+			pars += generateBooleanLayer (r, boolNodes);
+			break;
+		case AND:
+			pars += generateBooleanTopAnd (boolNodes);
+			break;
+		case OR:
+			pars += generateBooleanTopOr (boolNodes);
+			break;
+		case CNF:
+			pars += generateBooleanCNF (r, boolNodes, factor);
+			break;
     }
     assert (boolNodes.size() == 1);
     assert (boolNodes.get(0).getType() == BoolType.boolType);
